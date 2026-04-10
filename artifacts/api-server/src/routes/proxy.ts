@@ -1064,7 +1064,7 @@ router.post("/messages", async (req, res) => {
       const params: Anthropic.MessageCreateParams = {
         ...(cleanBody as Omit<Anthropic.MessageCreateParams, "model" | "max_tokens" | "messages">),
         model,
-        max_tokens: (cleanBody.max_tokens as number | undefined) ?? 8192,
+        max_tokens: clampMaxTokens(model, cleanBody.max_tokens as number | undefined),
         messages: cleanedMessages,
         system: cleanedSystem as Anthropic.MessageCreateParams["system"],
         ...(cleanedTools ? { tools: cleanedTools as AnthropicTool[] } : {}),
@@ -1205,7 +1205,7 @@ router.post("/responses", async (req, res) => {
       const effectiveBeta = withThinkingBeta(beta, thinking);
 
       const params: Anthropic.MessageCreateParams = {
-        model, max_tokens: maxTokens,
+        model, max_tokens: clampMaxTokens(model, maxTokens),
         messages: cleanMessages(messages) as AnthropicMessage[],
         system: system as string | undefined,
         ...(cleanedTools ? { tools: cleanedTools } : {}),
