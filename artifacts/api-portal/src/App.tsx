@@ -11,8 +11,8 @@ const ENDPOINTS = [
   { method: "POST", path: "/v1/messages",                       desc: "Anthropic 原生",    group: "oai" },
   { method: "POST", path: "/v1/chat/completions",               desc: "OpenAI / Gemini",   group: "oai" },
   { method: "POST", path: "/v1/responses",                      desc: "Responses API",     group: "oai" },
-  { method: "POST", path: "/v1beta/models/{model}:generateContent",       desc: "Gemini 原生",       group: "beta" },
-  { method: "POST", path: "/v1beta/models/{model}:streamGenerateContent", desc: "Gemini 流式",       group: "beta" },
+  { method: "GET",  path: "/v1beta/models",                              desc: "Gemini 模型列表",   group: "beta" },
+  { method: "POST", path: "/v1beta/models/{model}:generateContent",       desc: "Gemini 生成（含流式）", group: "beta" },
 ];
 
 interface ProviderStatus { available: boolean; checkedAt: number; error?: string }

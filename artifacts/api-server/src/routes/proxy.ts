@@ -57,6 +57,19 @@ const GEMINI_MODELS = [
 
 const ALL_MODELS = [...OPENAI_MODELS, ...ANTHROPIC_MODELS, ...GEMINI_MODELS];
 
+// ─── Per-model max output token caps ─────────────────────────────────────────
+// Some models have hard limits lower than the default we'd otherwise pass.
+const MODEL_MAX_OUTPUT: Record<string, number> = {
+  "claude-opus-4-1": 32000,
+};
+
+/** Return max_tokens clamped to the model's hard limit (if any). */
+function clampMaxTokens(model: string, requested: number | undefined, defaultVal = 8192): number {
+  const val = requested ?? defaultVal;
+  const cap = MODEL_MAX_OUTPUT[model];
+  return cap !== undefined ? Math.min(val, cap) : val;
+}
+
 // ─── Provider health (startup check) ─────────────────────────────────────────
 
 export interface ProviderStatus {
@@ -732,7 +745,7 @@ router.post("/chat/completions", async (req, res) => {
       const rawTools = body.tools as OpenAI.Chat.Completions.ChatCompletionTool[] | undefined;
       const tools = rawTools ? openAIToolsToAnthropic(rawTools) : undefined;
       const toolChoice = openAIToolChoiceToAnthropic(body.tool_choice);
-      const maxTokens = (body.max_tokens as number | undefined) ?? 8192;
+      const maxTokens = clampMaxTokens(model, body.max_tokens as number | undefined);
       const thinking = getThinkingParam(body);
       const effectiveBeta = withThinkingBeta(beta, thinking);
       // Sampling params
