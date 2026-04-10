@@ -44,6 +44,8 @@ Thumbs.db
 .cursor/rules/nx-rules.mdc
 .github/instructions/nx.instructions.md
 
-# Replit
+# Replit — exclude workspace-specific files that may contain secrets
 .cache/
 .local/
+.replit
+replit.nix
