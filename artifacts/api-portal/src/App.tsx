@@ -7,10 +7,12 @@ const MODELS = {
 };
 
 const ENDPOINTS = [
-  { method: "GET",  path: "/v1/models",           desc: "模型列表" },
-  { method: "POST", path: "/v1/messages",          desc: "Anthropic 原生" },
-  { method: "POST", path: "/v1/chat/completions",  desc: "OpenAI / Gemini 兼容" },
-  { method: "POST", path: "/v1/responses",         desc: "Responses API" },
+  { method: "GET",  path: "/v1/models",                         desc: "模型列表",          group: "oai" },
+  { method: "POST", path: "/v1/messages",                       desc: "Anthropic 原生",    group: "oai" },
+  { method: "POST", path: "/v1/chat/completions",               desc: "OpenAI / Gemini",   group: "oai" },
+  { method: "POST", path: "/v1/responses",                      desc: "Responses API",     group: "oai" },
+  { method: "POST", path: "/v1beta/models/{model}:generateContent",       desc: "Gemini 原生",       group: "beta" },
+  { method: "POST", path: "/v1beta/models/{model}:streamGenerateContent", desc: "Gemini 流式",       group: "beta" },
 ];
 
 interface ProviderStatus { available: boolean; checkedAt: number; error?: string }
@@ -102,11 +104,21 @@ export default function App() {
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
 
           <Card title="API 端点">
-            {ENDPOINTS.map((e) => (
-              <div key={e.path} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 9 }}>
-                <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, flexShrink: 0, background: e.method === "GET" ? "#1a3a5c" : "#2a1f4a", color: e.method === "GET" ? "#60a5fa" : "#a78bfa" }}>{e.method}</span>
-                <span style={{ fontFamily: "monospace", fontSize: 11, color: "#c4b5fd" }}>{e.path}</span>
-                <span style={{ fontSize: 10, color: "#6b7280", marginLeft: "auto", whiteSpace: "nowrap" }}>{e.desc}</span>
+            {[
+              { label: "/v1  OpenAI 兼容",   group: "oai"  },
+              { label: "/v1beta  Gemini 原生", group: "beta" },
+            ].map(({ label, group }, gi) => (
+              <div key={group} style={{ marginBottom: gi === 0 ? 12 : 0 }}>
+                <div style={{ fontSize: 9, fontWeight: 600, color: "#4b5563", textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: 6 }}>{label}</div>
+                {ENDPOINTS.filter(e => e.group === group).map((e) => (
+                  <div key={e.path} style={{ display: "flex", alignItems: "flex-start", gap: 7, marginBottom: 7 }}>
+                    <span style={{ fontSize: 9, fontWeight: 700, padding: "2px 5px", borderRadius: 4, flexShrink: 0, marginTop: 1, background: e.method === "GET" ? "#1a3a5c" : "#2a1f4a", color: e.method === "GET" ? "#60a5fa" : "#a78bfa" }}>{e.method}</span>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontFamily: "monospace", fontSize: 10, color: "#c4b5fd", wordBreak: "break-all" }}>{e.path}</div>
+                      <div style={{ fontSize: 10, color: "#6b7280", marginTop: 1 }}>{e.desc}</div>
+                    </div>
+                  </div>
+                ))}
               </div>
             ))}
           </Card>

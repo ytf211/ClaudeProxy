@@ -3,6 +3,7 @@ import cors from "cors";
 import pinoHttp from "pino-http";
 import router from "./routes";
 import proxyRouter from "./routes/proxy";
+import v1betaRouter from "./routes/v1beta";
 import { logger } from "./lib/logger";
 
 const app: Express = express();
@@ -32,5 +33,7 @@ app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 app.use("/api", router);
 app.use("/v1", proxyRouter);
+// Native Gemini SDK passthrough (x-goog-api-key auth → Replit Gemini proxy)
+app.use("/v1beta", v1betaRouter);
 
 export default app;
