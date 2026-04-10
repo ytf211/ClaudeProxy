@@ -31,6 +31,8 @@ const ANTHROPIC_MODELS = [
 
 const ALL_MODELS = [...OPENAI_MODELS, ...ANTHROPIC_MODELS];
 
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
 function verifyBearer(req: Request, res: Response): boolean {
   const auth = req.headers["authorization"] ?? "";
   const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7) : "";
@@ -50,6 +52,47 @@ function isOpenAIModel(model: string): boolean {
 function isAnthropicModel(model: string): boolean {
   return model.startsWith("claude-");
 }
+
+/** Extract the anthropic-beta header forwarded by Claude Code / other clients */
+function extractBeta(req: Request): string | undefined {
+  return (req.headers["anthropic-beta"] as string | undefined) ?? undefined;
+}
+
+/** Build RequestOptions with optional beta header */
+function reqOpts(beta?: string): Anthropic.RequestOptions | undefined {
+  return beta ? { headers: { "anthropic-beta": beta } } : undefined;
+}
+
+/**
+ * BUG FIX #1 — Streaming fallback for non-streaming Anthropic requests.
+ *
+ * Anthropic SDK throws "Streaming is required for operations that may take
+ * longer than 10 minutes" when it decides the request is too long.
+ * We catch that and fall back to stream → finalMessage().
+ */
+async function createAnthropicMessage(
+  params: Anthropic.MessageCreateParams,
+  beta?: string,
+): Promise<Anthropic.Message> {
+  const opts = reqOpts(beta);
+  try {
+    return await anthropic.messages.create(
+      { ...params, stream: false } as Anthropic.MessageCreateParamsNonStreaming,
+      opts,
+    );
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("Streaming is required")) {
+      const stream = anthropic.messages.stream(
+        params as Anthropic.MessageStreamParams,
+        opts,
+      );
+      return await stream.finalMessage();
+    }
+    throw err;
+  }
+}
+
+// ─── format converters ────────────────────────────────────────────────────────
 
 type OpenAITool = OpenAI.Chat.Completions.ChatCompletionTool;
 type AnthropicTool = Anthropic.Tool;
@@ -75,6 +118,49 @@ function openAIToolChoiceToAnthropic(
     return { type: "tool", name: choice.function.name };
   }
   return undefined;
+}
+
+/**
+ * BUG FIX #2 — user message content can be an array of content parts.
+ * rikkahub and many OpenAI-compatible clients send:
+ *   content: [{ type: "text", text: "..." }]
+ * or image parts:
+ *   content: [{ type: "image_url", image_url: { url: "data:..." } }]
+ */
+function openAIContentToAnthropic(
+  content: OpenAIMessage["content"],
+): Anthropic.MessageParam["content"] {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  const parts: Anthropic.ContentBlockParam[] = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      parts.push({ type: "text", text: part.text });
+    } else if (part.type === "image_url") {
+      const url =
+        typeof part.image_url === "string"
+          ? part.image_url
+          : (part.image_url as { url: string }).url;
+
+      if (url.startsWith("data:")) {
+        const commaIdx = url.indexOf(",");
+        const meta = url.slice(5, commaIdx); // e.g. "image/jpeg;base64"
+        const mediaType = meta.split(";")[0] as
+          | "image/jpeg"
+          | "image/png"
+          | "image/gif"
+          | "image/webp";
+        const data = url.slice(commaIdx + 1);
+        parts.push({ type: "image", source: { type: "base64", media_type: mediaType, data } });
+      } else {
+        parts.push({ type: "image", source: { type: "url", url } });
+      }
+    }
+  }
+  return parts.length === 1 && parts[0].type === "text"
+    ? (parts[0] as Anthropic.TextBlockParam).text
+    : parts;
 }
 
 function openAIMessagesToAnthropic(
@@ -130,8 +216,7 @@ function openAIMessagesToAnthropic(
     }
 
     if (msg.role === "user") {
-      const content = typeof msg.content === "string" ? msg.content : "";
-      result.push({ role: "user", content });
+      result.push({ role: "user", content: openAIContentToAnthropic(msg.content) });
     }
   }
 
@@ -189,6 +274,8 @@ function cleanMessages(messages: unknown[]): unknown[] {
   });
 }
 
+// ─── routes ───────────────────────────────────────────────────────────────────
+
 // GET /v1/models
 router.get("/models", (req, res) => {
   if (!verifyBearer(req, res)) return;
@@ -203,17 +290,20 @@ router.get("/models", (req, res) => {
   res.json({ object: "list", data: models });
 });
 
-// POST /v1/chat/completions — OpenAI-compatible endpoint
+// ─── POST /v1/chat/completions ────────────────────────────────────────────────
+
 router.post("/chat/completions", async (req, res) => {
   if (!verifyBearer(req, res)) return;
 
   const body = req.body as Record<string, unknown>;
   const model = (body.model as string) ?? "";
   const stream = body.stream === true;
+  const beta = extractBeta(req);
 
   if (debugLog) logger.debug({ model, stream }, "chat/completions request");
 
   try {
+    // ── Claude model via /chat/completions ──────────────────────────────────
     if (isAnthropicModel(model)) {
       const { system, messages } = openAIMessagesToAnthropic(
         (body.messages as OpenAIMessage[]) ?? [],
@@ -229,14 +319,17 @@ router.post("/chat/completions", async (req, res) => {
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
 
-        const anthropicStream = await anthropic.messages.stream({
-          model,
-          system,
-          messages: cleanMessages(messages) as AnthropicMessage[],
-          ...(tools ? { tools: cleanTools(tools) as AnthropicTool[] } : {}),
-          ...(toolChoice ? { tool_choice: toolChoice } : {}),
-          max_tokens: maxTokens,
-        });
+        const anthropicStream = anthropic.messages.stream(
+          {
+            model,
+            system,
+            messages: cleanMessages(messages) as AnthropicMessage[],
+            ...(tools ? { tools: cleanTools(tools) as AnthropicTool[] } : {}),
+            ...(toolChoice ? { tool_choice: toolChoice } : {}),
+            max_tokens: maxTokens,
+          },
+          reqOpts(beta),
+        );
 
         let inputTokens = 0;
         let outputTokens = 0;
@@ -317,19 +410,23 @@ router.post("/chat/completions", async (req, res) => {
         res.write("data: [DONE]\n\n");
         res.end();
       } else {
-        const anthropicResp = await anthropic.messages.create({
-          model,
-          system,
-          messages: cleanMessages(messages) as AnthropicMessage[],
-          ...(tools ? { tools: cleanTools(tools) as AnthropicTool[] } : {}),
-          ...(toolChoice ? { tool_choice: toolChoice } : {}),
-          max_tokens: maxTokens,
-        });
+        // BUG FIX #1: streaming fallback via createAnthropicMessage
+        const anthropicResp = await createAnthropicMessage(
+          {
+            model,
+            system,
+            messages: cleanMessages(messages) as AnthropicMessage[],
+            ...(tools ? { tools: cleanTools(tools) as AnthropicTool[] } : {}),
+            ...(toolChoice ? { tool_choice: toolChoice } : {}),
+            max_tokens: maxTokens,
+          },
+          beta,
+        );
 
-        const oaiContent = anthropicResp.content.map((block) => {
-          if (block.type === "text") return block.text;
-          return "";
-        }).join("") || null;
+        const oaiContent =
+          anthropicResp.content
+            .map((block) => (block.type === "text" ? block.text : ""))
+            .join("") || null;
 
         const toolCalls = anthropicResp.content
           .filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use")
@@ -362,6 +459,8 @@ router.post("/chat/completions", async (req, res) => {
           },
         });
       }
+
+    // ── OpenAI model via /chat/completions ───────────────────────────────────
     } else if (isOpenAIModel(model)) {
       const messages = (body.messages as OpenAIMessage[]) ?? [];
       const maxTokens = (body.max_tokens as number | undefined) ?? 8192;
@@ -398,6 +497,7 @@ router.post("/chat/completions", async (req, res) => {
         });
         res.json(oaiCompletion);
       }
+
     } else {
       res.status(400).json({ error: { message: `Unknown model: ${model}`, type: "invalid_request_error" } });
     }
@@ -413,20 +513,27 @@ router.post("/chat/completions", async (req, res) => {
   }
 });
 
-// POST /v1/messages — Anthropic-native endpoint
+// ─── POST /v1/messages ────────────────────────────────────────────────────────
+
 router.post("/messages", async (req, res) => {
   if (!verifyBearer(req, res)) return;
 
   const body = req.body as Record<string, unknown>;
   const model = (body.model as string) ?? "";
   const stream = body.stream === true;
+  const beta = extractBeta(req);
 
   if (debugLog) logger.debug({ model, stream }, "/v1/messages request");
 
-  // Strip fields that cause issues on Vertex AI / Replit proxies
-  const { output_config: _oc, stream_options: _so, reasoning_effort: _re, ...cleanBody } = body as Record<string, unknown>;
+  const {
+    output_config: _oc,
+    stream_options: _so,
+    reasoning_effort: _re,
+    ...cleanBody
+  } = body as Record<string, unknown>;
 
   try {
+    // ── Claude model via /messages ───────────────────────────────────────────
     if (isAnthropicModel(model)) {
       const rawMessages = (cleanBody.messages as unknown[]) ?? [];
       const cleanedMessages = cleanMessages(rawMessages) as AnthropicMessage[];
@@ -449,19 +556,24 @@ router.post("/messages", async (req, res) => {
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
 
-        const anthropicStream = await anthropic.messages.stream(
+        const anthropicStream = anthropic.messages.stream(
           anthropicParams as Anthropic.MessageStreamParams,
+          reqOpts(beta),
         );
 
+        // BUG FIX #5: don't manually emit message_stop — the SDK already
+        // includes it in the event stream. Just forward every event as-is.
         for await (const event of anthropicStream) {
           res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
         }
-        res.write("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
         res.end();
       } else {
-        const response = await anthropic.messages.create(anthropicParams);
+        // BUG FIX #1: streaming fallback via createAnthropicMessage
+        const response = await createAnthropicMessage(anthropicParams, beta);
         res.json(response);
       }
+
+    // ── OpenAI model via /messages ───────────────────────────────────────────
     } else if (isOpenAIModel(model)) {
       const { system, messages } = openAIMessagesToAnthropic(
         (cleanBody.messages as OpenAIMessage[]) ?? [],
@@ -484,12 +596,16 @@ router.post("/messages", async (req, res) => {
       const openAIToolChoice = openAIToolChoiceToAnthropic(
         cleanBody.tool_choice as Anthropic.ToolChoice | undefined,
       );
-      const oaiToolChoice: OpenAI.Chat.Completions.ChatCompletionToolChoiceOption | undefined = openAIToolChoice
-        ? openAIToolChoice.type === "auto" ? "auto"
-          : openAIToolChoice.type === "any" ? "required"
-          : openAIToolChoice.type === "tool" ? { type: "function", function: { name: (openAIToolChoice as Anthropic.ToolChoiceTool).name } }
-          : undefined
-        : undefined;
+      const oaiToolChoice: OpenAI.Chat.Completions.ChatCompletionToolChoiceOption | undefined =
+        openAIToolChoice
+          ? openAIToolChoice.type === "auto"
+            ? "auto"
+            : openAIToolChoice.type === "any"
+              ? "required"
+              : openAIToolChoice.type === "tool"
+                ? { type: "function", function: { name: (openAIToolChoice as Anthropic.ToolChoiceTool).name } }
+                : undefined
+          : undefined;
 
       if (stream) {
         res.setHeader("Content-Type", "text/event-stream");
@@ -568,6 +684,7 @@ router.post("/messages", async (req, res) => {
         };
         res.json(anthropicResponse);
       }
+
     } else {
       res.status(400).json({ error: { message: `Unknown model: ${model}`, type: "invalid_request_error" } });
     }
@@ -578,7 +695,8 @@ router.post("/messages", async (req, res) => {
       res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", message: errMsg } })}\n\n`);
       res.end();
     } else {
-      res.status(500).json({ error: { type: "error", error: { type: "server_error", message: errMsg } } });
+      // BUG FIX #3: correct Anthropic error envelope (remove double-wrapping)
+      res.status(500).json({ type: "error", error: { type: "server_error", message: errMsg } });
     }
   }
 });
