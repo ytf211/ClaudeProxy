@@ -78,6 +78,33 @@ function reqOpts(beta?: string): Anthropic.RequestOptions | undefined {
   return beta ? { headers: { "anthropic-beta": beta } } : undefined;
 }
 
+/**
+ * Extract the thinking config from a request body.
+ * Passes through whatever the client sends so we stay forward-compatible
+ * with new Anthropic thinking types (adaptive, enabled, disabled).
+ */
+function getThinkingParam(body: Record<string, unknown>): Anthropic.ThinkingConfigParam | undefined {
+  const t = body.thinking;
+  if (!t || typeof t !== "object") return undefined;
+  return t as Anthropic.ThinkingConfigParam;
+}
+
+/**
+ * When thinking is active (enabled or adaptive), inject the extended-thinking
+ * beta header unless it is already present in the client-supplied header.
+ * This ensures /v1/chat/completions clients (e.g. rikkahub) that send thinking
+ * params but omit the beta header still work correctly.
+ */
+function withThinkingBeta(beta: string | undefined, thinking: Anthropic.ThinkingConfigParam | undefined): string | undefined {
+  if (!thinking) return beta;
+  const type = (thinking as unknown as Record<string, unknown>).type;
+  if (type === "disabled") return beta;
+  const needed = "interleaved-thinking-2025-05-14";
+  if (!beta) return needed;
+  if (beta.includes(needed)) return beta;
+  return `${beta},${needed}`;
+}
+
 // ─── Streaming fallback for non-streaming Anthropic requests ──────────────────
 
 async function createAnthropicMessage(
@@ -595,6 +622,8 @@ router.post("/chat/completions", async (req, res) => {
       const tools = rawTools ? openAIToolsToAnthropic(rawTools) : undefined;
       const toolChoice = openAIToolChoiceToAnthropic(body.tool_choice);
       const maxTokens = (body.max_tokens as number | undefined) ?? 8192;
+      const thinking = getThinkingParam(body);
+      const effectiveBeta = withThinkingBeta(beta, thinking);
 
       if (stream) {
         sseHeaders(res);
@@ -606,8 +635,9 @@ router.post("/chat/completions", async (req, res) => {
           messages: cleanMessages(messages) as AnthropicMessage[],
           ...(tools ? { tools: cleanTools(tools) as AnthropicTool[] } : {}),
           ...(toolChoice ? { tool_choice: toolChoice } : {}),
+          ...(thinking ? { thinking } : {}),
           max_tokens: maxTokens,
-        }, reqOpts(beta));
+        }, reqOpts(effectiveBeta));
 
         for await (const e of s) {
           const ts = Math.floor(Date.now() / 1000);
@@ -638,8 +668,9 @@ router.post("/chat/completions", async (req, res) => {
           messages: cleanMessages(messages) as AnthropicMessage[],
           ...(tools ? { tools: cleanTools(tools) as AnthropicTool[] } : {}),
           ...(toolChoice ? { tool_choice: toolChoice } : {}),
+          ...(thinking ? { thinking } : {}),
           max_tokens: maxTokens,
-        }, beta);
+        }, effectiveBeta);
 
         const textContent = r.content.map((b) => b.type === "text" ? b.text : "").join("") || null;
         const toolCalls = r.content
@@ -719,6 +750,9 @@ router.post("/messages", async (req, res) => {
       const cleanedSystem = cleanSystemBlocks(cleanBody.system);
       const rawTools = cleanBody.tools as unknown[] | undefined;
       const cleanedTools = rawTools ? cleanTools(rawTools) : undefined;
+      // thinking passes through via cleanBody spread; we only need the beta injection
+      const thinkingParam = getThinkingParam(cleanBody);
+      const effectiveBeta = withThinkingBeta(beta, thinkingParam);
 
       const params: Anthropic.MessageCreateParams = {
         ...(cleanBody as Omit<Anthropic.MessageCreateParams, "model" | "max_tokens" | "messages">),
@@ -732,12 +766,12 @@ router.post("/messages", async (req, res) => {
 
       if (stream) {
         sseHeaders(res);
-        const s = anthropic.messages.stream(params as Anthropic.MessageStreamParams, reqOpts(beta));
+        const s = anthropic.messages.stream(params as Anthropic.MessageStreamParams, reqOpts(effectiveBeta));
         for await (const e of s) res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
         res.end();
         dbgRes("/v1/messages", { stream: true, model });
       } else {
-        const r = await createAnthropicMessage(params, beta);
+        const r = await createAnthropicMessage(params, effectiveBeta);
         dbgRes("/v1/messages", { model, stop_reason: r.stop_reason, usage: r.usage });
         res.json(r);
       }
@@ -853,12 +887,15 @@ router.post("/responses", async (req, res) => {
       const rawTools = body.tools as Array<Record<string, unknown>> | undefined;
       const tools = rawTools ? responsesToolsToAnthropic(rawTools) : undefined;
       const cleanedTools = tools ? (cleanTools(tools as unknown[]) as AnthropicTool[]) : undefined;
+      const thinking = getThinkingParam(body);
+      const effectiveBeta = withThinkingBeta(beta, thinking);
 
       const params: Anthropic.MessageCreateParams = {
         model, max_tokens: maxTokens,
         messages: cleanMessages(messages) as AnthropicMessage[],
         system: system as string | undefined,
         ...(cleanedTools ? { tools: cleanedTools } : {}),
+        ...(thinking ? { thinking } : {}),
         stream,
       };
 
@@ -874,7 +911,7 @@ router.post("/responses", async (req, res) => {
         writeSSE("response.output_item.added", { output_index: 0, item: { type: "message", id: msgId, role: "assistant", content: [], status: "in_progress" } });
         writeSSE("response.content_part.added", { item_id: msgId, output_index: 0, content_index: 0, part: { type: "output_text", text: "" } });
 
-        const s = anthropic.messages.stream(params as Anthropic.MessageStreamParams, reqOpts(beta));
+        const s = anthropic.messages.stream(params as Anthropic.MessageStreamParams, reqOpts(effectiveBeta));
         let fullText = "", inputTokens = 0, outputTokens = 0;
 
         for await (const e of s) {
@@ -895,7 +932,7 @@ router.post("/responses", async (req, res) => {
         dbgRes("/v1/responses", { stream: true, model });
 
       } else {
-        const r = await createAnthropicMessage(params, beta);
+        const r = await createAnthropicMessage(params, effectiveBeta);
         const result = anthropicToResponses(r);
         dbgRes("/v1/responses", { model, status: "completed" });
         res.json(result);
