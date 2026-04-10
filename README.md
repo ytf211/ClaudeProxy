@@ -17,84 +17,95 @@
 | `POST /v1/chat/completions` | OpenAI 兼容 Chat Completions |
 | `POST /v1/responses` | OpenAI Responses API |
 
-**支持特性**：流式 / 非流式、Tool Calling、Thinking Blocks、Prompt Caching、System Prompt、多模态
+**支持特性**：流式 / 非流式、Tool Calling、Thinking Blocks、Prompt Caching、多模态
 
 ---
 
 ## 可用模型
 
-| 提供商 | 模型 ID |
+| 提供商 | 模型 |
 |---|---|
 | Anthropic | `claude-opus-4-6` `claude-opus-4-5` `claude-opus-4-1` `claude-sonnet-4-6` `claude-sonnet-4-5` `claude-haiku-4-5` |
 | OpenAI | `gpt-4.1` `gpt-4.1-mini` `gpt-4.1-nano` `gpt-4o` `gpt-4o-mini` `o4-mini` `o3` `o3-mini` |
 
 ---
 
-## 一键部署到 Replit
+## 部署到 Replit
 
-### 步骤 1 — 导入项目
+点击上方 **Deploy on Replit** 按钮，或手动按以下步骤操作。
 
-点击上方 **Deploy on Replit** 按钮，或在 Replit 中选择 **Import from GitHub** 并填入：
+---
 
-```
-https://github.com/ytf211/ClaudeProxy
-```
+### 第一步：创建必要变量（最先做）
 
-### 步骤 2 — 连接 AI 集成（自动获取 API Key）
+导入项目后，在 Replit 左侧 **Secrets**（🔒）中创建：
 
-在 Replit 项目左侧工具栏找到 **Integrations**，依次连接：
-
-- **Anthropic** — 连接后自动注入 `AI_INTEGRATIONS_ANTHROPIC_API_KEY`
-- **OpenAI** — 连接后自动注入 `AI_INTEGRATIONS_OPENAI_API_KEY`
-
-> 这两个 Key 由 Replit AI Credits 管理，不需要你提供。
-
-### 步骤 3 — 设置访问密钥（唯一需要手动创建的 Secret）
-
-在 Replit 项目 **Secrets** 页面（🔒）添加：
-
-| Secret 名称 | 说明 |
+| 变量名 | 说明 |
 |---|---|
-| `PROXY_API_KEY` | 自定义访问密钥，任意字符串，例如 `my-secret-key` |
+| `PROXY_API_KEY` | 自定义访问密钥，任意字符串，例如 `my-key-123` |
+| `DEBUG_LOG` | 填写 `false`（正常使用）；填 `true` 可开启详细日志 |
 
-### 步骤 4 — 启动服务
+然后在左侧 **Integrations** 依次连接 **Anthropic** 和 **OpenAI**，Replit 会自动注入 API Key，无需自备。
 
-Replit 会自动识别 workflows，点击 **Run** 或手动启动：
+---
 
-- `artifacts/api-server: API Server`
-- `artifacts/api-portal: web`
+### 第二步：安装依赖
 
-### 步骤 5 — 验证部署
+在 Shell 中执行：
 
 ```bash
-# 健康检查（无需 Key）
-curl https://<你的域名>.replit.app/api/healthz
-# 期望返回: {"status":"ok","startedAt":...}
-
-# 发送消息测试
-curl -X POST https://<你的域名>.replit.app/v1/messages \
-  -H "x-api-key: <你的 PROXY_API_KEY>" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"claude-haiku-4-5","max_tokens":64,"messages":[{"role":"user","content":"Hi"}]}'
+pnpm install --frozen-lockfile
 ```
 
-### 步骤 6 — 发布
+> 项目已声明 Node.js 24，Replit 会自动准备运行环境，无需手动安装。
 
-点击 Replit 右上角 **Publish** → **Deploy** 即可获得永久域名。
+---
+
+### 第三步：启动并测试后端
+
+启动后端 workflow（`API Server`），等待就绪后验证：
+
+```bash
+# 健康检查（无需 key）
+curl http://localhost:8080/api/healthz
+# → {"status":"ok","startedAt":...}
+
+# API 调用测试
+curl -X POST http://localhost:8080/v1/messages \
+  -H "x-api-key: <你的 PROXY_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-haiku-4-5","max_tokens":32,"messages":[{"role":"user","content":"Hi"}]}'
+# → {"type":"message","role":"assistant",...}
+```
+
+**后端测试通过后再继续。**
+
+---
+
+### 第四步：启动前端
+
+启动前端 workflow（`web`），访问根路径，状态页应显示绿色「运行正常」。
+
+---
+
+### 第五步：完整验证后发布
+
+```bash
+PROXY_API_KEY=<你的密钥> bash scripts/check-deploy.sh http://localhost:8080
+```
+
+全部通过后点击右上角 **Publish → Deploy** 获得永久域名。
 
 ---
 
 ## 认证方式
 
 ```
-# Anthropic 风格（Claude Code 等）
-x-api-key: <PROXY_API_KEY>
-
-# OpenAI 风格（Cursor、Open WebUI 等）
-Authorization: Bearer <PROXY_API_KEY>
+x-api-key: <PROXY_API_KEY>            # Anthropic 风格（Claude Code 等）
+Authorization: Bearer <PROXY_API_KEY>  # OpenAI 风格（Cursor 等）
 ```
 
-使用 `x-api-key` 时，`/v1/models` 只返回 Claude 模型；使用 `Bearer` 时返回全部模型。
+使用 `x-api-key` 时 `/v1/models` 只返回 Claude 模型；使用 `Bearer` 时返回全部模型。
 
 ---
 
@@ -121,9 +132,9 @@ Model    : claude-sonnet-4-6
 
 ## 技术栈
 
-- **Monorepo**: pnpm workspaces (Node.js 24)
+- **Monorepo**: pnpm workspaces · Node.js 24
 - **后端**: Express 5 + TypeScript 5 + esbuild
-- **前端**: React 18 + Vite 6（状态页）
+- **前端**: React 18 + Vite 6
 - **AI SDK**: `@anthropic-ai/sdk` + `openai`
 - **日志**: pino
 
@@ -133,11 +144,11 @@ Model    : claude-sonnet-4-6
 
 | 现象 | 原因 | 解决 |
 |---|---|---|
-| 状态页显示红色 | api-server 未运行 | 重启 `API Server` workflow |
+| 状态页红色 | 后端未运行 | 重启 `API Server` workflow |
 | 401 Unauthorized | PROXY_API_KEY 不匹配 | 确认 Secret 值与请求中的 key 一致 |
-| 流式响应中断 | 代理超时 | 已内置 `keepAliveTimeout=65s`，通常无需处理 |
-| 模型 not found | 模型名拼写错误 | 参考上方模型列表 |
-| 前端空白 | 端口配置 | 确认 vite.config.ts 读取了 `process.env.PORT` |
+| AI 调用 401/403 | AI 集成未连接 | 在 Integrations 连接 Anthropic / OpenAI |
+| 流式响应中断 | 代理超时 | 已内置 keepAliveTimeout=65s，通常无需处理 |
+| 模型 not found | 拼写错误 | 参考上方模型列表 |
 
 ---
 
