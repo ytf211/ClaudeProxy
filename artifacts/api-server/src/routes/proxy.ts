@@ -255,8 +255,13 @@ function openAIContentToAnthropic(
 
   const parts: Anthropic.ContentBlockParam[] = [];
   for (const part of content) {
+    const p = part as unknown as Record<string, unknown>;
+    // Preserve cache_control if the client sends it as an OAI extension
+    const cc = p.cache_control as Anthropic.CacheControlEphemeral | undefined;
     if (part.type === "text") {
-      parts.push({ type: "text", text: part.text });
+      const block: Anthropic.TextBlockParam = { type: "text", text: part.text };
+      if (cc) block.cache_control = cc;
+      parts.push(block);
     } else if (part.type === "image_url") {
       const url =
         typeof part.image_url === "string"
@@ -272,21 +277,36 @@ function openAIContentToAnthropic(
       }
     }
   }
-  return parts.length === 1 && parts[0].type === "text"
-    ? (parts[0] as Anthropic.TextBlockParam).text
-    : parts;
+  // Only collapse to plain string if there is exactly one text block with NO cache_control
+  if (parts.length === 1 && parts[0].type === "text" && !(parts[0] as Anthropic.TextBlockParam).cache_control) {
+    return (parts[0] as Anthropic.TextBlockParam).text;
+  }
+  return parts;
 }
 
 /** Convert OAI-format messages → Anthropic messages + system string */
 function openAIMessagesToAnthropic(
   messages: OAIMessage[],
-): { system?: string; messages: AnthropicMessage[] } {
-  let system: string | undefined;
+): { system?: string | Anthropic.TextBlockParam[]; messages: AnthropicMessage[] } {
+  let system: string | Anthropic.TextBlockParam[] | undefined;
   const result: AnthropicMessage[] = [];
 
   for (const msg of messages) {
     if (msg.role === "system") {
-      system = typeof msg.content === "string" ? msg.content : "";
+      if (typeof msg.content === "string") {
+        system = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        // Support array system content (e.g. with cache_control blocks)
+        const blocks: Anthropic.TextBlockParam[] = (msg.content as unknown as Record<string, unknown>[])
+          .filter((p) => p.type === "text")
+          .map((p) => {
+            const block: Anthropic.TextBlockParam = { type: "text", text: p.text as string };
+            const cc = p.cache_control as Anthropic.CacheControlEphemeral | undefined;
+            if (cc) block.cache_control = cc;
+            return block;
+          });
+        system = blocks.length === 1 && !blocks[0].cache_control ? blocks[0].text : blocks;
+      }
       continue;
     }
 
