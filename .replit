@@ -38,3 +38,4 @@ externalPort = 3001
 [userenv]
 
 [userenv.shared]
+DEBUG_LOG = "true"
