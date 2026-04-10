@@ -5,17 +5,16 @@ export const debugLog = process.env.DEBUG_LOG === "true" || process.env.DEBUG_LO
 
 export const logger = pino({
   level: debugLog ? "debug" : (process.env.LOG_LEVEL ?? "info"),
-  redact: [
-    "req.headers.authorization",
-    "req.headers.cookie",
-    "res.headers['set-cookie']",
-  ],
+  // In debug mode expose all headers (auth values are partially redacted in proxy.ts itself)
+  redact: debugLog
+    ? []
+    : ["req.headers.authorization", "req.headers.cookie", "res.headers['set-cookie']"],
   ...(isProduction && !debugLog
     ? {}
     : {
         transport: {
           target: "pino-pretty",
-          options: { colorize: true },
+          options: { colorize: true, ignore: "hostname,pid" },
         },
       }),
 });

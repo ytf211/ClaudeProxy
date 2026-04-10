@@ -19,6 +19,21 @@ pnpm 单体仓库
 - **后端**（api-server）：Express 5 代理服务器，不对外提供任何 HTML，只处理 `/api/*` 和 `/v1/*`。
 - **部署时**：前端静态构建后托管在 `/`，后端作为 API 服务运行。客户端发起的 `/api/healthz` 等请求由 Replit 路由代理到 api-server。
 
+## 支持的 API 端点
+
+| 端点 | 说明 |
+|------|------|
+| `GET /v1/models` | 模型列表（x-api-key → 仅 Claude；Bearer → 全部） |
+| `POST /v1/messages` | Anthropic Messages API 原生格式 |
+| `POST /v1/chat/completions` | OpenAI Chat Completions 兼容格式 |
+| `POST /v1/responses` | OpenAI Responses API（新版，流式/非流式均支持） |
+| `GET /api/healthz` | 健康检查 |
+
+## 认证与模型路由
+
+- `x-api-key: <PROXY_API_KEY>` → Anthropic 风格客户端（Claude Code 等），`/v1/models` 只返回 Claude 模型
+- `Authorization: Bearer <PROXY_API_KEY>` → OpenAI 风格客户端（Cursor 等），`/v1/models` 返回全部 14 个模型
+
 ---
 
 ## 必需的 Secrets（在 Replit Secrets 中设置）
@@ -26,8 +41,9 @@ pnpm 单体仓库
 | Secret 名称 | 说明 |
 |---|---|
 | `PROXY_API_KEY` | 客户端访问密钥，任意字符串，自定义 |
-| `AI_INTEGRATIONS_ANTHROPIC_API_KEY` | Anthropic 官方 API Key |
-| `AI_INTEGRATIONS_OPENAI_API_KEY` | OpenAI 官方 API Key |
+| `AI_INTEGRATIONS_ANTHROPIC_API_KEY` | Anthropic 官方 API Key（由 Replit AI Credits 管理） |
+| `AI_INTEGRATIONS_OPENAI_API_KEY` | OpenAI 官方 API Key（由 Replit AI Credits 管理） |
+| `DEBUG_LOG` | 调试日志开关，设为 `true` 或 `1` 开启详细日志（包含请求头、格式信息，不含消息文本） |
 
 ## 必需的环境变量（非敏感，可直接硬编码或设为 Env Var）
 

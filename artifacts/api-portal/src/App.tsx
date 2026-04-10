@@ -6,10 +6,11 @@ const MODELS = {
 };
 
 const ENDPOINTS = [
-  { method: "GET", path: "/api/healthz", desc: "健康检查" },
-  { method: "GET", path: "/v1/models", desc: "模型列表" },
-  { method: "POST", path: "/v1/messages", desc: "Anthropic 原生" },
-  { method: "POST", path: "/v1/chat/completions", desc: "OpenAI 兼容" },
+  { method: "GET",  path: "/api/healthz",          desc: "健康检查" },
+  { method: "GET",  path: "/v1/models",             desc: "模型列表" },
+  { method: "POST", path: "/v1/messages",           desc: "Anthropic 原生" },
+  { method: "POST", path: "/v1/chat/completions",   desc: "OpenAI 兼容" },
+  { method: "POST", path: "/v1/responses",          desc: "OpenAI Responses API" },
 ];
 
 const TABS = ["Claude Code", "Cursor / OpenAI", "cURL 测试"] as const;
