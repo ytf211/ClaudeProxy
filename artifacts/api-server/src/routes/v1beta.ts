@@ -15,6 +15,10 @@ import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
 
+/** Hard upstream timeout: 5 minutes for streaming, 2 minutes for non-streaming. */
+const STREAM_TIMEOUT_MS  = 5 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = 2 * 60 * 1000;
+
 const GEMINI_MODELS = [
   {
     name: "models/gemini-3.1-pro-preview",
@@ -120,7 +124,10 @@ router.all(/(.*)/, async (req: Request, res: Response) => {
     return;
   }
 
-  // Build target URL: strip leading slash from req.path, append query string
+  // Detect streaming by URL path (streamGenerateContent) or query param
+  const isStream = req.path.includes("streamGenerateContent") || req.query["alt"] === "sse";
+
+  // Build target URL
   const queryStr = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
   const targetPath = req.path.replace(/^\//, "");
   const targetUrl = `${backendBase.replace(/\/$/, "")}/${targetPath}${queryStr}`;
@@ -138,7 +145,18 @@ router.all(/(.*)/, async (req: Request, res: Response) => {
 
   const hasBody = ["POST", "PUT", "PATCH"].includes(req.method.toUpperCase());
 
-  logger.debug({ method: req.method, targetUrl }, "v1beta proxy");
+  logger.debug({ method: req.method, targetUrl, isStream }, "v1beta proxy");
+
+  // AbortController: cancelled on client disconnect OR hard timeout
+  const controller = new AbortController();
+  const timeoutMs = isStream ? STREAM_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`Upstream timeout after ${timeoutMs / 1000}s`));
+  }, timeoutMs);
+
+  // Cancel upstream when client disconnects
+  const onClose = () => controller.abort(new Error("Client disconnected"));
+  res.on("close", onClose);
 
   let upstream: globalThis.Response;
   try {
@@ -146,11 +164,18 @@ router.all(/(.*)/, async (req: Request, res: Response) => {
       method: req.method,
       headers: forwardHeaders,
       body: hasBody ? JSON.stringify(req.body) : undefined,
+      signal: controller.signal,
     });
   } catch (err) {
+    clearTimeout(timer);
+    res.off("close", onClose);
+    if ((err as Error).name === "AbortError" || controller.signal.aborted) {
+      if (!res.headersSent) res.status(499).json({ error: { code: "CANCELLED", message: "Request cancelled" } });
+      return;
+    }
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ err: msg, targetUrl }, "v1beta upstream fetch error");
-    res.status(502).json({ error: { code: "UPSTREAM_ERROR", message: msg } });
+    if (!res.headersSent) res.status(502).json({ error: { code: "UPSTREAM_ERROR", message: msg } });
     return;
   }
 
@@ -160,19 +185,27 @@ router.all(/(.*)/, async (req: Request, res: Response) => {
   if (ct) res.setHeader("content-type", ct);
 
   if (!upstream.body) {
+    clearTimeout(timer);
+    res.off("close", onClose);
     res.end();
     return;
   }
 
-  // Stream the response body back
+  // Stream the response body back; abort reader on client disconnect
   const reader = upstream.body.getReader();
   try {
     while (true) {
+      if (controller.signal.aborted) break;
       const { done, value } = await reader.read();
       if (done) break;
       res.write(Buffer.from(value));
     }
+  } catch (err) {
+    logger.debug({ err: (err as Error).message }, "v1beta stream read error");
   } finally {
+    clearTimeout(timer);
+    res.off("close", onClose);
+    try { reader.cancel(); } catch {}
     res.end();
   }
 });

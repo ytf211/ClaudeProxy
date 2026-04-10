@@ -375,35 +375,42 @@ function openAIContentToAnthropic(
 function openAIMessagesToAnthropic(
   messages: OAIMessage[],
 ): { system?: string | Anthropic.TextBlockParam[]; messages: AnthropicMessage[] } {
-  let system: string | Anthropic.TextBlockParam[] | undefined;
+  // Accumulate all system blocks (support multiple system messages by merging)
+  const systemBlocks: Anthropic.TextBlockParam[] = [];
   const result: AnthropicMessage[] = [];
 
   for (const msg of messages) {
     if (msg.role === "system") {
-      if (typeof msg.content === "string") {
-        system = msg.content;
+      if (typeof msg.content === "string" && msg.content) {
+        systemBlocks.push({ type: "text", text: msg.content });
       } else if (Array.isArray(msg.content)) {
-        // Support array system content (e.g. with cache_control blocks)
         const blocks: Anthropic.TextBlockParam[] = (msg.content as unknown as Record<string, unknown>[])
-          .filter((p) => p.type === "text")
+          .filter((p) => p.type === "text" && p.text)
           .map((p) => {
             const block: Anthropic.TextBlockParam = { type: "text", text: p.text as string };
             const cc = p.cache_control as Anthropic.CacheControlEphemeral | undefined;
             if (cc) block.cache_control = cc;
             return block;
           });
-        system = blocks.length === 1 && !blocks[0].cache_control ? blocks[0].text : blocks;
+        systemBlocks.push(...blocks);
       }
       continue;
     }
 
     if (msg.role === "tool") {
+      // Validate tool_call_id
+      const toolCallId = msg.tool_call_id;
+      if (!toolCallId) {
+        logger.warn("tool message missing tool_call_id — skipping");
+        continue;
+      }
       const last = result[result.length - 1];
       const block: Anthropic.ToolResultBlockParam = {
         type: "tool_result",
-        tool_use_id: msg.tool_call_id ?? "",
-        content: typeof msg.content === "string" ? msg.content : "",
+        tool_use_id: toolCallId,
+        content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? ""),
       };
+      // Batch multiple tool results into a single user message (required by Anthropic)
       if (last?.role === "user" && Array.isArray(last.content)) {
         (last.content as Anthropic.ToolResultBlockParam[]).push(block);
       } else {
@@ -417,7 +424,8 @@ function openAIMessagesToAnthropic(
       if (typeof msg.content === "string" && msg.content) {
         contentBlocks.push({ type: "text", text: msg.content });
       }
-      if (msg.tool_calls) {
+      if (msg.tool_calls && msg.tool_calls.length > 0) {
+        // Multi-tool: convert all tool_calls simultaneously
         for (const tc of msg.tool_calls) {
           if (tc.type !== "function") continue;
           const ftc = tc as OpenAI.Chat.Completions.ChatCompletionMessageFunctionToolCall;
@@ -426,6 +434,8 @@ function openAIMessagesToAnthropic(
           contentBlocks.push({ type: "tool_use", id: tc.id, name: ftc.function.name, input });
         }
       }
+      // Skip empty assistant messages (no text, no tool calls)
+      if (contentBlocks.length === 0) continue;
       result.push({ role: "assistant", content: contentBlocks });
       continue;
     }
@@ -433,6 +443,14 @@ function openAIMessagesToAnthropic(
     if (msg.role === "user") {
       result.push({ role: "user", content: openAIContentToAnthropic(msg.content) });
     }
+  }
+
+  // Collapse system blocks: single plain string if possible, array otherwise
+  let system: string | Anthropic.TextBlockParam[] | undefined;
+  if (systemBlocks.length === 1 && !systemBlocks[0].cache_control) {
+    system = systemBlocks[0].text;
+  } else if (systemBlocks.length > 1) {
+    system = systemBlocks;
   }
 
   return { system, messages: result };
@@ -742,9 +760,11 @@ router.post("/chat/completions", async (req, res) => {
   try {
     if (isAnthropicModel(model)) {
       const { system, messages } = openAIMessagesToAnthropic((body.messages as OAIMessage[]) ?? []);
-      const rawTools = body.tools as OpenAI.Chat.Completions.ChatCompletionTool[] | undefined;
+      // When tool_choice="none", strip tools entirely so Anthropic doesn't call them
+      const suppressTools = body.tool_choice === "none";
+      const rawTools = suppressTools ? undefined : body.tools as OpenAI.Chat.Completions.ChatCompletionTool[] | undefined;
       const tools = rawTools ? openAIToolsToAnthropic(rawTools) : undefined;
-      const toolChoice = openAIToolChoiceToAnthropic(body.tool_choice);
+      const toolChoice = suppressTools ? undefined : openAIToolChoiceToAnthropic(body.tool_choice);
       const maxTokens = clampMaxTokens(model, body.max_tokens as number | undefined);
       const thinking = getThinkingParam(body);
       const effectiveBeta = withThinkingBeta(beta, thinking);
@@ -872,20 +892,34 @@ router.post("/chat/completions", async (req, res) => {
 
       // ── Convert OAI messages → Gemini format ──────────────────────────────
       type GeminiPart = Record<string, unknown>;
+
+      // Pre-scan: build tool_call_id → function_name map for correct multi-tool result routing
+      const toolIdToName: Record<string, string> = {};
+      for (const m of oaiMsgs) {
+        const am = m as Record<string, unknown>;
+        if (m.role === "assistant" && Array.isArray(am.tool_calls)) {
+          for (const tc of am.tool_calls as Array<Record<string, unknown>>) {
+            const fn = tc.function as Record<string, unknown>;
+            if (tc.id && fn.name) toolIdToName[tc.id as string] = fn.name as string;
+          }
+        }
+      }
+
       const systemParts: { text: string }[] = [];
       const rawContents: { role: "user" | "model"; parts: GeminiPart[] }[] = [];
       for (const m of oaiMsgs) {
         if (m.role === "tool") {
           // OAI tool result → Gemini functionResponse part
+          // Use the actual function name from the pre-built map (not the id)
           const toolCallId = (m as Record<string, unknown>).tool_call_id as string ?? "";
-          const fnName = toolCallId; // best effort; real name comes from context
+          const fnName = toolIdToName[toolCallId] || toolCallId;
           const textContent = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
           let responseData: unknown;
           try { responseData = JSON.parse(textContent); } catch { responseData = textContent; }
           rawContents.push({ role: "user", parts: [{ functionResponse: { name: fnName, response: { content: responseData } } }] });
           continue;
         }
-        // assistant with tool_calls → Gemini functionCall parts
+        // assistant with tool_calls → Gemini functionCall parts (all at once for multi-tool)
         const assistantMsg = m as Record<string, unknown>;
         if (m.role === "assistant" && Array.isArray(assistantMsg.tool_calls)) {
           const fcParts: GeminiPart[] = (assistantMsg.tool_calls as Array<Record<string, unknown>>).map((tc) => {

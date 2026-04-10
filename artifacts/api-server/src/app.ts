@@ -27,7 +27,29 @@ app.use(
     },
   }),
 );
-app.use(cors());
+
+// Tightened CORS: allow any origin (needed for CLI/app clients) but restrict
+// methods/headers and disable credential forwarding.
+app.use(cors({
+  origin: true,
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "x-api-key",
+    "x-goog-api-key",
+    "anthropic-version",
+    "anthropic-beta",
+    "x-stainless-arch",
+    "x-stainless-lang",
+    "x-stainless-os",
+    "x-stainless-package-version",
+    "x-stainless-runtime",
+    "x-stainless-runtime-version",
+  ],
+  credentials: false,
+}));
+
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
