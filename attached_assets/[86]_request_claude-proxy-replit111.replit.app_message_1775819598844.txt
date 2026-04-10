@@ -1,0 +1,7 @@
+GET /v1beta/models?pageSize=100 h2
+host: claude-proxy-replit111.replit.app
+x-goog-api-key: ytf211
+accept-language: zh-CN, zh;q=0.9
+user-agent: RikkaHub-Android/2.1.7
+accept-encoding: gzip
+
