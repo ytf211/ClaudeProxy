@@ -7,25 +7,31 @@ const router: IRouter = Router();
 
 const openai = new OpenAI({
   baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
-  apiKey: process.env.PROXY_API_KEY ?? "dummy",
+  apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY ?? "dummy",
 });
 
 const anthropic = new Anthropic({
   baseURL: process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL,
-  apiKey: process.env.PROXY_API_KEY ?? "dummy",
+  apiKey: process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY ?? "dummy",
 });
 
 const OPENAI_MODELS = [
-  { id: "gpt-5.2", provider: "openai" },
-  { id: "gpt-5-mini", provider: "openai" },
-  { id: "gpt-5-nano", provider: "openai" },
+  { id: "gpt-4.1", provider: "openai" },
+  { id: "gpt-4.1-mini", provider: "openai" },
+  { id: "gpt-4.1-nano", provider: "openai" },
+  { id: "gpt-4o", provider: "openai" },
+  { id: "gpt-4o-mini", provider: "openai" },
   { id: "o4-mini", provider: "openai" },
   { id: "o3", provider: "openai" },
+  { id: "o3-mini", provider: "openai" },
 ];
 
 const ANTHROPIC_MODELS = [
   { id: "claude-opus-4-6", provider: "anthropic" },
+  { id: "claude-opus-4-5", provider: "anthropic" },
+  { id: "claude-opus-4-1", provider: "anthropic" },
   { id: "claude-sonnet-4-6", provider: "anthropic" },
+  { id: "claude-sonnet-4-5", provider: "anthropic" },
   { id: "claude-haiku-4-5", provider: "anthropic" },
 ];
 

@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 
 const MODELS = {
-  anthropic: ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
-  openai: ["gpt-5.2", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3"],
+  anthropic: ["claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-1", "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-haiku-4-5"],
+  openai: ["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini", "o4-mini", "o3", "o3-mini"],
 };
 
 const ENDPOINTS = [
