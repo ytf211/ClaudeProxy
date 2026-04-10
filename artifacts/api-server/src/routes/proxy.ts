@@ -1,6 +1,7 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenAI } from "@google/genai";
 import { logger, debugLog } from "../lib/logger";
 
 const router: IRouter = Router();
@@ -13,6 +14,16 @@ const openai = new OpenAI({
 const anthropic = new Anthropic({
   baseURL: process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL,
   apiKey: process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY ?? "dummy",
+});
+
+// Gemini via Replit AI Integrations — must set apiVersion:"" so the SDK
+// doesn't prepend /v1beta/ to the proxy's own URL structure
+const gemini = new GoogleGenAI({
+  apiKey: process.env.AI_INTEGRATIONS_GEMINI_API_KEY ?? "dummy",
+  httpOptions: {
+    apiVersion: "",
+    baseUrl: process.env.AI_INTEGRATIONS_GEMINI_BASE_URL,
+  },
 });
 
 // ─── Model lists ──────────────────────────────────────────────────────────────
@@ -37,7 +48,67 @@ const ANTHROPIC_MODELS = [
   { id: "claude-haiku-4-5",  provider: "anthropic" },
 ];
 
-const ALL_MODELS = [...OPENAI_MODELS, ...ANTHROPIC_MODELS];
+const GEMINI_MODELS = [
+  { id: "gemini-3.1-pro-preview", provider: "gemini" },
+  { id: "gemini-3-pro-preview",   provider: "gemini" },
+  { id: "gemini-3-flash-preview", provider: "gemini" },
+  { id: "gemini-2.5-pro",         provider: "gemini" },
+  { id: "gemini-2.5-flash",       provider: "gemini" },
+];
+
+const ALL_MODELS = [...OPENAI_MODELS, ...ANTHROPIC_MODELS, ...GEMINI_MODELS];
+
+// ─── Provider health (startup check) ─────────────────────────────────────────
+
+export interface ProviderStatus {
+  available: boolean;
+  checkedAt: number;
+  error?: string;
+}
+
+export const providerHealth: Record<string, ProviderStatus> = {
+  anthropic: { available: false, checkedAt: 0 },
+  openai:    { available: false, checkedAt: 0 },
+  gemini:    { available: false, checkedAt: 0 },
+};
+
+async function checkProvider(name: string, fn: () => Promise<void>) {
+  try {
+    await fn();
+    providerHealth[name] = { available: true, checkedAt: Date.now() };
+    logger.info({ provider: name }, "Provider available");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    providerHealth[name] = { available: false, checkedAt: Date.now(), error: msg };
+    logger.warn({ provider: name, err: msg }, "Provider unavailable");
+  }
+}
+
+export async function runStartupHealthCheck() {
+  logger.info("Running startup provider health checks...");
+  await Promise.all([
+    checkProvider("anthropic", async () => {
+      await anthropic.messages.create({
+        model: "claude-haiku-4-5", max_tokens: 1,
+        messages: [{ role: "user", content: "hi" }],
+      });
+    }),
+    checkProvider("openai", async () => {
+      await openai.chat.completions.create({
+        model: "gpt-4.1-nano", max_completion_tokens: 1,
+        messages: [{ role: "user", content: "hi" }], stream: false,
+      } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming);
+    }),
+    checkProvider("gemini", async () => {
+      await gemini.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [{ role: "user", parts: [{ text: "hi" }] }],
+        config: { maxOutputTokens: 1 },
+      });
+    }),
+  ]);
+  logger.info({ providerHealth }, "Startup health check complete");
+}
 
 // ─── Auth helpers ─────────────────────────────────────────────────────────────
 
@@ -66,6 +137,10 @@ function isOpenAIModel(model: string): boolean {
 
 function isAnthropicModel(model: string): boolean {
   return model.startsWith("claude-");
+}
+
+function isGeminiModel(model: string): boolean {
+  return model.startsWith("gemini-");
 }
 
 // ─── Request options / beta header ───────────────────────────────────────────
@@ -613,14 +688,31 @@ function sseHeaders(res: Response) {
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 // GET /v1/models
-// x-api-key (Anthropic-style) → Claude models only
-// Authorization: Bearer (OAI-style) → all models
+// x-api-key only (Anthropic-style)         → Claude models only
+// Bearer + ?provider=gemini                 → Gemini models only
+// Bearer (default)                          → all models (OAI + Claude + Gemini)
 router.get("/models", (req, res) => {
   if (!verifyBearer(req, res)) return;
-  const anthropicOnly = isAnthropicStyleAuth(req);
-  const list = anthropicOnly ? ANTHROPIC_MODELS : ALL_MODELS;
-  if (debugLog) logger.debug({ anthropicOnly, count: list.length }, "GET /v1/models");
-  res.json({ object: "list", data: list.map((m) => ({ id: m.id, object: "model", created: 0, owned_by: m.provider })) });
+  const providerFilter = (req.query.provider as string | undefined)?.toLowerCase();
+  let list: typeof ALL_MODELS;
+  if (isAnthropicStyleAuth(req)) {
+    list = ANTHROPIC_MODELS;
+  } else if (providerFilter === "gemini") {
+    list = GEMINI_MODELS;
+  } else if (providerFilter === "openai") {
+    list = OPENAI_MODELS;
+  } else if (providerFilter === "anthropic") {
+    list = ANTHROPIC_MODELS;
+  } else {
+    list = ALL_MODELS;
+  }
+  // Annotate each model with its availability
+  const data = list.map((m) => ({
+    id: m.id, object: "model", created: 0, owned_by: m.provider,
+    available: providerHealth[m.provider]?.available ?? null,
+  }));
+  if (debugLog) logger.debug({ providerFilter, count: list.length }, "GET /v1/models");
+  res.json({ object: "list", data });
 });
 
 // ─── POST /v1/chat/completions ────────────────────────────────────────────────
@@ -755,6 +847,79 @@ router.post("/chat/completions", async (req, res) => {
         } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming);
         dbgRes("/v1/chat/completions", { model, finish_reason: c.choices[0]?.finish_reason, usage: c.usage });
         res.json(c);
+      }
+
+    } else if (isGeminiModel(model)) {
+      const oaiMsgs = (body.messages as OAIMessage[]) ?? [];
+      const maxTokens = (body.max_tokens as number | undefined) ?? 8192;
+      const temperature = body.temperature as number | undefined;
+      const topP = body.top_p as number | undefined;
+      const stopSeq: string[] | undefined = body.stop
+        ? (Array.isArray(body.stop) ? body.stop as string[] : [body.stop as string])
+        : undefined;
+
+      // Convert OAI messages → Gemini format, extracting system instruction
+      const systemParts: { text: string }[] = [];
+      const rawContents: { role: "user" | "model"; parts: { text: string }[] }[] = [];
+      for (const m of oaiMsgs) {
+        const text = typeof m.content === "string" ? m.content
+          : Array.isArray(m.content)
+            ? (m.content as Array<{ type: string; text?: string }>).filter(b => b.type === "text" && b.text).map(b => b.text!).join("\n")
+            : "";
+        if (m.role === "system") { if (text) systemParts.push({ text }); }
+        else { const role = m.role === "assistant" ? "model" as const : "user" as const; if (text) rawContents.push({ role, parts: [{ text }] }); }
+      }
+      // Merge consecutive same-role turns (Gemini requirement)
+      const contents: { role: "user" | "model"; parts: { text: string }[] }[] = [];
+      for (const c of rawContents) {
+        const last = contents[contents.length - 1];
+        if (last && last.role === c.role) last.parts.push(...c.parts);
+        else contents.push({ role: c.role, parts: [...c.parts] });
+      }
+      if (!contents.length || contents[0].role !== "user") contents.unshift({ role: "user", parts: [{ text: "" }] });
+
+      const config: Record<string, unknown> = { maxOutputTokens: maxTokens };
+      if (systemParts.length) config.systemInstruction = { parts: systemParts };
+      if (temperature !== undefined) config.temperature = temperature;
+      if (topP !== undefined) config.topP = topP;
+      if (stopSeq) config.stopSequences = stopSeq;
+
+      if (stream) {
+        sseHeaders(res);
+        const id = `chatcmpl-gemini-${Date.now()}`;
+        const ts = Math.floor(Date.now() / 1000);
+        res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] })}\n\n`);
+        const s = await gemini.models.generateContentStream({ model, contents, config });
+        let promptTokens = 0, completionTokens = 0;
+        for await (const chunk of s) {
+          const text = chunk.text;
+          if (text) res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`);
+          if (chunk.usageMetadata) {
+            promptTokens = (chunk.usageMetadata as Record<string, number>).promptTokenCount ?? 0;
+            completionTokens = (chunk.usageMetadata as Record<string, number>).candidatesTokenCount ?? 0;
+          }
+        }
+        const total = promptTokens + completionTokens;
+        res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: total } })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        dbgRes("/v1/chat/completions", { stream: true, model });
+      } else {
+        const r = await gemini.models.generateContent({ model, contents, config });
+        const text = r.text ?? "";
+        const usage = (r.usageMetadata ?? {}) as Record<string, number>;
+        const promptTokens = usage.promptTokenCount ?? 0;
+        const completionTokens = usage.candidatesTokenCount ?? 0;
+        const resp = {
+          id: `chatcmpl-gemini-${Date.now()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
+        };
+        dbgRes("/v1/chat/completions", { model, usage: resp.usage });
+        res.json(resp);
       }
 
     } else {

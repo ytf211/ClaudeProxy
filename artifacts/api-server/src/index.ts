@@ -1,5 +1,6 @@
 import app from "./app";
 import { logger } from "./lib/logger";
+import { runStartupHealthCheck } from "./routes/proxy";
 
 const rawPort = process.env["PORT"];
 
@@ -22,6 +23,8 @@ const server = app.listen(port, (err) => {
   }
 
   logger.info({ port }, "Server listening");
+  // Run provider health checks in the background after startup
+  runStartupHealthCheck().catch((err) => logger.error({ err }, "Startup health check failed"));
 });
 
 // Disable the default 5-minute request timeout so long-running AI responses
