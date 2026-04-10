@@ -644,6 +644,12 @@ router.post("/chat/completions", async (req, res) => {
       const maxTokens = (body.max_tokens as number | undefined) ?? 8192;
       const thinking = getThinkingParam(body);
       const effectiveBeta = withThinkingBeta(beta, thinking);
+      // Sampling params
+      const temperature = body.temperature as number | undefined;
+      const topP = body.top_p as number | undefined;
+      const topK = body.top_k as number | undefined;
+      const rawStop = body.stop_sequences ?? body.stop;
+      const stopSequences = rawStop ? (Array.isArray(rawStop) ? rawStop as string[] : [rawStop as string]) : undefined;
 
       if (stream) {
         sseHeaders(res);
@@ -656,6 +662,10 @@ router.post("/chat/completions", async (req, res) => {
           ...(tools ? { tools: cleanTools(tools) as AnthropicTool[] } : {}),
           ...(toolChoice ? { tool_choice: toolChoice } : {}),
           ...(thinking ? { thinking } : {}),
+          ...(temperature !== undefined ? { temperature } : {}),
+          ...(topP !== undefined ? { top_p: topP } : {}),
+          ...(topK !== undefined ? { top_k: topK } : {}),
+          ...(stopSequences ? { stop_sequences: stopSequences } : {}),
           max_tokens: maxTokens,
         }, reqOpts(effectiveBeta));
 
@@ -689,6 +699,10 @@ router.post("/chat/completions", async (req, res) => {
           ...(tools ? { tools: cleanTools(tools) as AnthropicTool[] } : {}),
           ...(toolChoice ? { tool_choice: toolChoice } : {}),
           ...(thinking ? { thinking } : {}),
+          ...(temperature !== undefined ? { temperature } : {}),
+          ...(topP !== undefined ? { top_p: topP } : {}),
+          ...(topK !== undefined ? { top_k: topK } : {}),
+          ...(stopSequences ? { stop_sequences: stopSequences } : {}),
           max_tokens: maxTokens,
         }, effectiveBeta);
 
@@ -712,6 +726,11 @@ router.post("/chat/completions", async (req, res) => {
       const maxTokens = (body.max_tokens as number | undefined) ?? 8192;
       const rawTools = body.tools as OAIFunctionTool[] | undefined;
       const toolChoice = body.tool_choice as OpenAI.Chat.Completions.ChatCompletionToolChoiceOption | undefined;
+      // Sampling & generation params — pass through whatever the client sends
+      const oaiExtra: Record<string, unknown> = {};
+      for (const k of ["temperature", "top_p", "seed", "stop", "presence_penalty", "frequency_penalty", "response_format", "reasoning_effort"]) {
+        if (body[k] !== undefined) oaiExtra[k] = body[k];
+      }
 
       if (stream) {
         sseHeaders(res);
@@ -719,8 +738,9 @@ router.post("/chat/completions", async (req, res) => {
           model, messages,
           ...(rawTools ? { tools: rawTools } : {}),
           ...(toolChoice ? { tool_choice: toolChoice } : {}),
+          ...oaiExtra,
           max_completion_tokens: maxTokens, stream: true,
-        });
+        } as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming);
         for await (const chunk of s) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
@@ -730,8 +750,9 @@ router.post("/chat/completions", async (req, res) => {
           model, messages,
           ...(rawTools ? { tools: rawTools } : {}),
           ...(toolChoice ? { tool_choice: toolChoice } : {}),
+          ...oaiExtra,
           max_completion_tokens: maxTokens, stream: false,
-        });
+        } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming);
         dbgRes("/v1/chat/completions", { model, finish_reason: c.choices[0]?.finish_reason, usage: c.usage });
         res.json(c);
       }
@@ -811,6 +832,11 @@ router.post("/messages", async (req, res) => {
 
       const oaiToolChoice = anthropicToolChoiceToOAI(cleanBody.tool_choice);
 
+      // Sampling params (Anthropic field names, passed to OAI)
+      const oaiSampling: Record<string, unknown> = {};
+      if (cleanBody.temperature !== undefined) oaiSampling.temperature = cleanBody.temperature;
+      if (cleanBody.top_p !== undefined) oaiSampling.top_p = cleanBody.top_p;
+
       if (stream) {
         sseHeaders(res);
         const msgId = `msg_${Date.now()}`;
@@ -824,8 +850,9 @@ router.post("/messages", async (req, res) => {
           model, messages: oaiMessages,
           ...(oaiTools ? { tools: oaiTools } : {}),
           ...(oaiToolChoice ? { tool_choice: oaiToolChoice } : {}),
+          ...oaiSampling,
           max_completion_tokens: maxTokens, stream: true,
-        });
+        } as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming);
 
         for await (const chunk of s) {
           const text = chunk.choices[0]?.delta?.content;
@@ -845,8 +872,9 @@ router.post("/messages", async (req, res) => {
           model, messages: oaiMessages,
           ...(oaiTools ? { tools: oaiTools } : {}),
           ...(oaiToolChoice ? { tool_choice: oaiToolChoice } : {}),
+          ...oaiSampling,
           max_completion_tokens: maxTokens, stream: false,
-        });
+        } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming);
         const choice = c.choices[0];
         const content: Anthropic.ContentBlockParam[] = [];
         if (choice?.message?.content) content.push({ type: "text", text: choice.message.content });
