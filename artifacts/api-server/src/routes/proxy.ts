@@ -3,6 +3,16 @@ import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import { GoogleGenAI } from "@google/genai";
 import { logger, debugLog } from "../lib/logger";
+import {
+  clampMaxTokens,
+  type OAIFunctionTool, type OAIMessage, type AnthropicTool, type AnthropicMessage,
+  isOpenAIModel, isAnthropicModel, isGeminiModel,
+  openAIToolsToAnthropic, openAIToolChoiceToAnthropic, anthropicToolChoiceToOAI,
+  openAIContentToAnthropic, openAIMessagesToAnthropic, anthropicMessagesToOAI,
+  systemToString, cleanTools, cleanSystemBlocks, cleanMessages,
+} from "../lib/converters";
+import { withRetry } from "../lib/retry";
+import { breakers, CircuitOpenError } from "../lib/circuit-breaker";
 
 const router: IRouter = Router();
 
@@ -56,19 +66,6 @@ const GEMINI_MODELS = [
 ];
 
 const ALL_MODELS = [...OPENAI_MODELS, ...ANTHROPIC_MODELS, ...GEMINI_MODELS];
-
-// ─── Per-model max output token caps ─────────────────────────────────────────
-// Some models have hard limits lower than the default we'd otherwise pass.
-const MODEL_MAX_OUTPUT: Record<string, number> = {
-  "claude-opus-4-1": 32000,
-};
-
-/** Return max_tokens clamped to the model's hard limit (if any). */
-function clampMaxTokens(model: string, requested: number | undefined, defaultVal = 8192): number {
-  const val = requested ?? defaultVal;
-  const cap = MODEL_MAX_OUTPUT[model];
-  return cap !== undefined ? Math.min(val, cap) : val;
-}
 
 // ─── Provider health (startup check) ─────────────────────────────────────────
 
@@ -141,20 +138,6 @@ function isAnthropicStyleAuth(req: Request): boolean {
   return !!(req.headers["x-api-key"]) && !req.headers["authorization"];
 }
 
-// ─── Model type helpers ───────────────────────────────────────────────────────
-
-function isOpenAIModel(model: string): boolean {
-  return model.startsWith("gpt-") || /^o\d/.test(model);
-}
-
-function isAnthropicModel(model: string): boolean {
-  return model.startsWith("claude-");
-}
-
-function isGeminiModel(model: string): boolean {
-  return model.startsWith("gemini-");
-}
-
 // ─── Request options / beta header ───────────────────────────────────────────
 
 function extractBeta(req: Request): string | undefined {
@@ -198,19 +181,35 @@ async function createAnthropicMessage(
   params: Anthropic.MessageCreateParams,
   beta?: string,
 ): Promise<Anthropic.Message> {
-  const opts = reqOpts(beta);
-  try {
-    return await anthropic.messages.create(
-      { ...params, stream: false } as Anthropic.MessageCreateParamsNonStreaming,
-      opts,
-    );
-  } catch (err) {
-    if (err instanceof Error && err.message.includes("Streaming is required")) {
-      const stream = anthropic.messages.stream(params as Anthropic.MessageStreamParams, opts);
-      return await stream.finalMessage();
-    }
-    throw err;
+  return withRetry(
+    () => breakers.anthropic.execute(async () => {
+      const opts = reqOpts(beta);
+      try {
+        return await anthropic.messages.create(
+          { ...params, stream: false } as Anthropic.MessageCreateParamsNonStreaming,
+          opts,
+        );
+      } catch (err) {
+        if (err instanceof Error && err.message.includes("Streaming is required")) {
+          const stream = anthropic.messages.stream(params as Anthropic.MessageStreamParams, opts);
+          return await stream.finalMessage();
+        }
+        throw err;
+      }
+    }),
+    {},
+    "anthropic-message",
+  );
+}
+
+/** Fast-fail if a provider's circuit breaker is OPEN. Returns true if blocked. */
+function circuitBlock(res: Response, provider: "anthropic" | "openai" | "gemini"): boolean {
+  if (breakers[provider].isOpen) {
+    const err = new CircuitOpenError(provider);
+    res.status(503).json({ error: { message: err.message, type: "service_unavailable", code: "circuit_open" } });
+    return true;
   }
+  return false;
 }
 
 // ─── Debug log helpers ────────────────────────────────────────────────────────
@@ -275,315 +274,6 @@ function dbgReq(endpoint: string, req: Request, body: Record<string, unknown>) {
 function dbgRes(endpoint: string, shape: unknown) {
   if (!debugLog) return;
   logger.debug({ response: shape }, `← ${endpoint}`);
-}
-
-// ─── Type aliases ─────────────────────────────────────────────────────────────
-
-// OpenAI v6 changed ChatCompletionTool to a union (FunctionTool | CustomTool).
-// We only work with standard function tools, so narrow to the function variant.
-type OAIFunctionTool = OpenAI.Chat.Completions.ChatCompletionFunctionTool;
-type OAIMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
-type AnthropicTool = Anthropic.Tool;
-type AnthropicMessage = Anthropic.MessageParam;
-
-// ─── Format converters: OpenAI → Anthropic ───────────────────────────────────
-
-function openAIToolsToAnthropic(tools: OpenAI.Chat.Completions.ChatCompletionTool[]): AnthropicTool[] {
-  return tools
-    .filter((t): t is OAIFunctionTool => t.type === "function")
-    .map((t) => ({
-      name: t.function.name,
-      description: t.function.description ?? "",
-      input_schema: t.function.parameters as Anthropic.Tool.InputSchema,
-    }));
-}
-
-/**
- * Convert OpenAI tool_choice to Anthropic ToolChoice.
- * Accepts a loose type since both OAI and Anthropic formats are passed in practice.
- */
-function openAIToolChoiceToAnthropic(
-  choice: unknown,
-): Anthropic.ToolChoice | undefined {
-  if (!choice) return undefined;
-  if (choice === "auto") return { type: "auto" };
-  if (choice === "none") return undefined; // Anthropic has no "none" — omit tool_choice, leave tools empty if needed
-  if (choice === "required") return { type: "any" };
-  if (typeof choice === "object") {
-    const c = choice as Record<string, unknown>;
-    if (c.type === "function" && c.function) {
-      return { type: "tool", name: (c.function as Record<string, unknown>).name as string };
-    }
-  }
-  return undefined;
-}
-
-/**
- * Convert Anthropic tool_choice to OpenAI tool_choice.
- * Used in /v1/messages when routing an Anthropic-format request to an OAI model.
- */
-function anthropicToolChoiceToOAI(
-  choice: unknown,
-): OpenAI.Chat.Completions.ChatCompletionToolChoiceOption | undefined {
-  if (!choice || typeof choice !== "object") return undefined;
-  const c = choice as Record<string, unknown>;
-  if (c.type === "auto") return "auto";
-  if (c.type === "any") return "required";
-  if (c.type === "none") return "none";
-  if (c.type === "tool" && c.name) return { type: "function", function: { name: c.name as string } };
-  return undefined;
-}
-
-function openAIContentToAnthropic(
-  content: OAIMessage["content"],
-): Anthropic.MessageParam["content"] {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-
-  const parts: Anthropic.ContentBlockParam[] = [];
-  for (const part of content) {
-    const p = part as unknown as Record<string, unknown>;
-    // Preserve cache_control if the client sends it as an OAI extension
-    const cc = p.cache_control as Anthropic.CacheControlEphemeral | undefined;
-    if (part.type === "text") {
-      const block: Anthropic.TextBlockParam = { type: "text", text: part.text };
-      if (cc) block.cache_control = cc;
-      parts.push(block);
-    } else if (part.type === "image_url") {
-      const url =
-        typeof part.image_url === "string"
-          ? part.image_url
-          : (part.image_url as { url: string }).url;
-      if (url.startsWith("data:")) {
-        const ci = url.indexOf(",");
-        const mediaType = url.slice(5, ci).split(";")[0] as
-          "image/jpeg" | "image/png" | "image/gif" | "image/webp";
-        parts.push({ type: "image", source: { type: "base64", media_type: mediaType, data: url.slice(ci + 1) } });
-      } else {
-        parts.push({ type: "image", source: { type: "url", url } });
-      }
-    }
-  }
-  // Only collapse to plain string if there is exactly one text block with NO cache_control
-  if (parts.length === 1 && parts[0].type === "text" && !(parts[0] as Anthropic.TextBlockParam).cache_control) {
-    return (parts[0] as Anthropic.TextBlockParam).text;
-  }
-  return parts;
-}
-
-/** Convert OAI-format messages → Anthropic messages + system string */
-function openAIMessagesToAnthropic(
-  messages: OAIMessage[],
-): { system?: string | Anthropic.TextBlockParam[]; messages: AnthropicMessage[] } {
-  // Accumulate all system blocks (support multiple system messages by merging)
-  const systemBlocks: Anthropic.TextBlockParam[] = [];
-  const result: AnthropicMessage[] = [];
-
-  for (const msg of messages) {
-    if (msg.role === "system") {
-      if (typeof msg.content === "string" && msg.content) {
-        systemBlocks.push({ type: "text", text: msg.content });
-      } else if (Array.isArray(msg.content)) {
-        const blocks: Anthropic.TextBlockParam[] = (msg.content as unknown as Record<string, unknown>[])
-          .filter((p) => p.type === "text" && p.text)
-          .map((p) => {
-            const block: Anthropic.TextBlockParam = { type: "text", text: p.text as string };
-            const cc = p.cache_control as Anthropic.CacheControlEphemeral | undefined;
-            if (cc) block.cache_control = cc;
-            return block;
-          });
-        systemBlocks.push(...blocks);
-      }
-      continue;
-    }
-
-    if (msg.role === "tool") {
-      // Validate tool_call_id
-      const toolCallId = msg.tool_call_id;
-      if (!toolCallId) {
-        logger.warn("tool message missing tool_call_id — skipping");
-        continue;
-      }
-      const last = result[result.length - 1];
-      const block: Anthropic.ToolResultBlockParam = {
-        type: "tool_result",
-        tool_use_id: toolCallId,
-        content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? ""),
-      };
-      // Batch multiple tool results into a single user message (required by Anthropic)
-      if (last?.role === "user" && Array.isArray(last.content)) {
-        (last.content as Anthropic.ToolResultBlockParam[]).push(block);
-      } else {
-        result.push({ role: "user", content: [block] });
-      }
-      continue;
-    }
-
-    if (msg.role === "assistant") {
-      const contentBlocks: Anthropic.ContentBlockParam[] = [];
-      if (typeof msg.content === "string" && msg.content) {
-        contentBlocks.push({ type: "text", text: msg.content });
-      }
-      if (msg.tool_calls && msg.tool_calls.length > 0) {
-        // Multi-tool: convert all tool_calls simultaneously
-        for (const tc of msg.tool_calls) {
-          if (tc.type !== "function") continue;
-          const ftc = tc as OpenAI.Chat.Completions.ChatCompletionMessageFunctionToolCall;
-          let input: Record<string, unknown> = {};
-          try { input = JSON.parse(ftc.function.arguments); } catch { input = {}; }
-          contentBlocks.push({ type: "tool_use", id: tc.id, name: ftc.function.name, input });
-        }
-      }
-      // Skip empty assistant messages (no text, no tool calls)
-      if (contentBlocks.length === 0) continue;
-      result.push({ role: "assistant", content: contentBlocks });
-      continue;
-    }
-
-    if (msg.role === "user") {
-      result.push({ role: "user", content: openAIContentToAnthropic(msg.content) });
-    }
-  }
-
-  // Collapse system blocks: single plain string if possible, array otherwise
-  let system: string | Anthropic.TextBlockParam[] | undefined;
-  if (systemBlocks.length === 1 && !systemBlocks[0].cache_control) {
-    system = systemBlocks[0].text;
-  } else if (systemBlocks.length > 1) {
-    system = systemBlocks;
-  }
-
-  return { system, messages: result };
-}
-
-/**
- * Convert Anthropic-format messages → OAI messages.
- * Used in /v1/messages when the model is an OpenAI model.
- */
-function anthropicMessagesToOAI(
-  messages: AnthropicMessage[],
-  system?: string,
-): OAIMessage[] {
-  const result: OAIMessage[] = [];
-
-  if (system) result.push({ role: "system", content: system });
-
-  for (const msg of messages) {
-    const role = msg.role as "user" | "assistant";
-    const content = msg.content;
-
-    if (typeof content === "string") {
-      result.push({ role, content });
-      continue;
-    }
-
-    if (!Array.isArray(content)) continue;
-
-    if (role === "user") {
-      const toolResults = content.filter(
-        (b): b is Anthropic.ToolResultBlockParam =>
-          (b as Anthropic.ToolResultBlockParam).type === "tool_result",
-      );
-      const other = content.filter(
-        (b) => (b as { type: string }).type !== "tool_result",
-      );
-
-      if (other.length > 0) {
-        const text = other
-          .filter((b): b is Anthropic.TextBlockParam => (b as Anthropic.TextBlockParam).type === "text")
-          .map((b) => b.text)
-          .join("\n");
-        if (text) result.push({ role: "user", content: text });
-      }
-
-      for (const tr of toolResults) {
-        result.push({
-          role: "tool",
-          tool_call_id: tr.tool_use_id,
-          content: typeof tr.content === "string" ? tr.content : "",
-        });
-      }
-    } else {
-      // assistant
-      const textBlocks = content.filter(
-        (b): b is Anthropic.TextBlockParam => (b as Anthropic.TextBlockParam).type === "text",
-      );
-      const toolUseBlocks = content.filter(
-        (b): b is Anthropic.ToolUseBlockParam => (b as Anthropic.ToolUseBlockParam).type === "tool_use",
-      );
-
-      const text = textBlocks.map((b) => b.text).join("\n") || null;
-      const tool_calls: OpenAI.Chat.Completions.ChatCompletionMessageToolCall[] = toolUseBlocks.map((b) => ({
-        id: b.id,
-        type: "function" as const,
-        function: { name: b.name, arguments: JSON.stringify(b.input) },
-      }));
-
-      result.push({
-        role: "assistant",
-        content: text,
-        ...(tool_calls.length > 0 ? { tool_calls } : {}),
-      });
-    }
-  }
-
-  return result;
-}
-
-// ─── Cleaners ─────────────────────────────────────────────────────────────────
-
-function cleanTools(tools: unknown[]): unknown[] {
-  return tools.map((t) => {
-    const tool = { ...(t as Record<string, unknown>) };
-    if (tool.type === "custom") delete tool.type;
-    if (tool.input_schema == null) tool.input_schema = { type: "object", properties: {} };
-    return tool;
-  });
-}
-
-function cleanSystemBlocks(system: unknown): unknown {
-  if (!system || typeof system === "string") return system;
-  if (!Array.isArray(system)) return system;
-  return system.map((block: Record<string, unknown>) => {
-    if (block.cache_control && typeof block.cache_control === "object") {
-      const { scope: _scope, ...restCC } = block.cache_control as Record<string, unknown>;
-      const cleaned = { ...block, cache_control: Object.keys(restCC).length > 0 ? restCC : undefined };
-      if (!cleaned.cache_control) delete (cleaned as Record<string, unknown>).cache_control;
-      return cleaned;
-    }
-    return block;
-  });
-}
-
-function cleanMessages(messages: unknown[]): unknown[] {
-  return messages.map((msg) => {
-    const m = msg as Record<string, unknown>;
-    if (m.role !== "assistant" || !Array.isArray(m.content)) return m;
-    const cleaned = (m.content as Record<string, unknown>[])
-      .map((block) => {
-        if (block.type !== "thinking") return block;
-        const sig = (block.signature as string | undefined) ?? "";
-        const think = (block.thinking as string | undefined) ?? "";
-        if (!sig && !think) return null;
-        if (!sig) return { type: "text", text: `<thinking>\n${think}\n</thinking>` };
-        return block;
-      })
-      .filter(Boolean);
-    return { ...m, content: cleaned };
-  });
-}
-
-/** Extract plain system string from Anthropic system field (string | TextBlock[]) */
-function systemToString(system: unknown): string | undefined {
-  if (!system) return undefined;
-  if (typeof system === "string") return system;
-  if (Array.isArray(system)) {
-    return (system as Array<Record<string, unknown>>)
-      .filter((b) => b.type === "text")
-      .map((b) => b.text as string)
-      .join("\n") || undefined;
-  }
-  return undefined;
 }
 
 // ─── Responses API converters ─────────────────────────────────────────────────
@@ -776,6 +466,7 @@ router.post("/chat/completions", async (req, res) => {
       const stopSequences = rawStop ? (Array.isArray(rawStop) ? rawStop as string[] : [rawStop as string]) : undefined;
 
       if (stream) {
+        if (circuitBlock(res, "anthropic")) return;
         sseHeaders(res);
         const id = `chatcmpl-${Date.now()}`;
         let inputTokens = 0, outputTokens = 0;
@@ -857,6 +548,7 @@ router.post("/chat/completions", async (req, res) => {
       }
 
       if (stream) {
+        if (circuitBlock(res, "openai")) return;
         sseHeaders(res);
         const s = await openai.chat.completions.create({
           model, messages,
@@ -870,13 +562,16 @@ router.post("/chat/completions", async (req, res) => {
         res.end();
         dbgRes("/v1/chat/completions", { stream: true, model });
       } else {
-        const c = await openai.chat.completions.create({
-          model, messages,
-          ...(rawTools ? { tools: rawTools } : {}),
-          ...(toolChoice ? { tool_choice: toolChoice } : {}),
-          ...oaiExtra,
-          max_completion_tokens: maxTokens, stream: false,
-        } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming);
+        const c = await withRetry(
+          () => breakers.openai.execute(() => openai.chat.completions.create({
+            model, messages,
+            ...(rawTools ? { tools: rawTools } : {}),
+            ...(toolChoice ? { tool_choice: toolChoice } : {}),
+            ...oaiExtra,
+            max_completion_tokens: maxTokens, stream: false,
+          } as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming)),
+          {}, "openai-chat",
+        );
         dbgRes("/v1/chat/completions", { model, finish_reason: c.choices[0]?.finish_reason, usage: c.usage });
         res.json(c);
       }
@@ -1003,6 +698,7 @@ router.post("/chat/completions", async (req, res) => {
 
       if (stream) {
         // ── Streaming: use Gemini streamGenerateContent ───────────────────
+        if (circuitBlock(res, "gemini")) return;
         sseHeaders(res);
         const ts = Math.floor(Date.now() / 1000);
         const streamUrl = `${geminiBaseUrl}/models/${model}:streamGenerateContent?alt=sse`;
@@ -1106,6 +802,7 @@ router.post("/messages", async (req, res) => {
       };
 
       if (stream) {
+        if (circuitBlock(res, "anthropic")) return;
         sseHeaders(res);
         const s = anthropic.messages.stream(params as Anthropic.MessageStreamParams, reqOpts(effectiveBeta));
         for await (const e of s) res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
