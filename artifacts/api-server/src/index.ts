@@ -15,7 +15,7 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-app.listen(port, (err) => {
+const server = app.listen(port, (err) => {
   if (err) {
     logger.error({ err }, "Error listening on port");
     process.exit(1);
@@ -23,3 +23,8 @@ app.listen(port, (err) => {
 
   logger.info({ port }, "Server listening");
 });
+
+// Disable the default 5-minute request timeout so long-running AI responses
+// (e.g. extended thinking, large tool calls) are never cut off by the server.
+server.requestTimeout = 0;
+server.keepAliveTimeout = 65000;
