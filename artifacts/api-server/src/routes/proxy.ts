@@ -50,7 +50,6 @@ const ANTHROPIC_MODELS = [
 
 const GEMINI_MODELS = [
   { id: "gemini-3.1-pro-preview", provider: "gemini" },
-  { id: "gemini-3-pro-preview",   provider: "gemini" },
   { id: "gemini-3-flash-preview", provider: "gemini" },
   { id: "gemini-2.5-pro",         provider: "gemini" },
   { id: "gemini-2.5-flash",       provider: "gemini" },
@@ -858,10 +857,33 @@ router.post("/chat/completions", async (req, res) => {
         ? (Array.isArray(body.stop) ? body.stop as string[] : [body.stop as string])
         : undefined;
 
-      // Convert OAI messages → Gemini format, extracting system instruction
+      // ── Convert OAI messages → Gemini format ──────────────────────────────
+      type GeminiPart = Record<string, unknown>;
       const systemParts: { text: string }[] = [];
-      const rawContents: { role: "user" | "model"; parts: { text: string }[] }[] = [];
+      const rawContents: { role: "user" | "model"; parts: GeminiPart[] }[] = [];
       for (const m of oaiMsgs) {
+        if (m.role === "tool") {
+          // OAI tool result → Gemini functionResponse part
+          const toolCallId = (m as Record<string, unknown>).tool_call_id as string ?? "";
+          const fnName = toolCallId; // best effort; real name comes from context
+          const textContent = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+          let responseData: unknown;
+          try { responseData = JSON.parse(textContent); } catch { responseData = textContent; }
+          rawContents.push({ role: "user", parts: [{ functionResponse: { name: fnName, response: { content: responseData } } }] });
+          continue;
+        }
+        // assistant with tool_calls → Gemini functionCall parts
+        const assistantMsg = m as Record<string, unknown>;
+        if (m.role === "assistant" && Array.isArray(assistantMsg.tool_calls)) {
+          const fcParts: GeminiPart[] = (assistantMsg.tool_calls as Array<Record<string, unknown>>).map((tc) => {
+            const fn = tc.function as Record<string, unknown>;
+            let args: unknown;
+            try { args = typeof fn.arguments === "string" ? JSON.parse(fn.arguments as string) : fn.arguments; } catch { args = {}; }
+            return { functionCall: { name: fn.name, args } };
+          });
+          rawContents.push({ role: "model", parts: fcParts });
+          continue;
+        }
         const text = typeof m.content === "string" ? m.content
           : Array.isArray(m.content)
             ? (m.content as Array<{ type: string; text?: string }>).filter(b => b.type === "text" && b.text).map(b => b.text!).join("\n")
@@ -870,7 +892,7 @@ router.post("/chat/completions", async (req, res) => {
         else { const role = m.role === "assistant" ? "model" as const : "user" as const; if (text) rawContents.push({ role, parts: [{ text }] }); }
       }
       // Merge consecutive same-role turns (Gemini requirement)
-      const contents: { role: "user" | "model"; parts: { text: string }[] }[] = [];
+      const contents: { role: "user" | "model"; parts: GeminiPart[] }[] = [];
       for (const c of rawContents) {
         const last = contents[contents.length - 1];
         if (last && last.role === c.role) last.parts.push(...c.parts);
@@ -878,47 +900,113 @@ router.post("/chat/completions", async (req, res) => {
       }
       if (!contents.length || contents[0].role !== "user") contents.unshift({ role: "user", parts: [{ text: "" }] });
 
-      const config: Record<string, unknown> = { maxOutputTokens: maxTokens };
-      if (systemParts.length) config.systemInstruction = { parts: systemParts };
-      if (temperature !== undefined) config.temperature = temperature;
-      if (topP !== undefined) config.topP = topP;
-      if (stopSeq) config.stopSequences = stopSeq;
+      // ── Convert OAI tools → Gemini function declarations ──────────────────
+      type OAITool = { type: string; function: { name: string; description?: string; parameters?: unknown } };
+      const oaiTools = body.tools as OAITool[] | undefined;
+      const geminiTools: unknown[] | undefined = oaiTools?.length
+        ? [{ functionDeclarations: oaiTools.map((t) => ({ name: t.function.name, description: t.function.description ?? "", parameters: t.function.parameters ?? {} })) }]
+        : undefined;
+
+      // ── Build Gemini REST body (direct fetch avoids SDK quirks with tools) ─
+      const genConfig: Record<string, unknown> = { maxOutputTokens: maxTokens };
+      if (temperature !== undefined) genConfig.temperature = temperature;
+      if (topP !== undefined) genConfig.topP = topP;
+      if (stopSeq) genConfig.stopSequences = stopSeq;
+
+      const geminiBody: Record<string, unknown> = { contents, generationConfig: genConfig };
+      if (systemParts.length) geminiBody.systemInstruction = { parts: systemParts };
+      if (geminiTools) geminiBody.tools = geminiTools;
+
+      const geminiBaseUrl = (process.env.AI_INTEGRATIONS_GEMINI_BASE_URL ?? "").replace(/\/$/, "");
+      const geminiKey = process.env.AI_INTEGRATIONS_GEMINI_API_KEY ?? "dummy";
+      const geminiHeaders = { "Content-Type": "application/json", "x-goog-api-key": geminiKey };
+
+      // ── Helper: parse Gemini REST response → OAI format ───────────────────
+      function candidateToOAI(raw: Record<string, unknown>, sid: string) {
+        const usage = (raw.usageMetadata ?? {}) as Record<string, number>;
+        const promptTokens = usage.promptTokenCount ?? 0;
+        const completionTokens = usage.candidatesTokenCount ?? 0;
+        const cands = raw.candidates as Array<Record<string, unknown>> | undefined;
+        const cand = cands?.[0];
+        const parts = ((cand?.content as Record<string, unknown>)?.parts ?? []) as GeminiPart[];
+        const fcParts = parts.filter(p => p.functionCall);
+        const textContent = parts.filter(p => typeof p.text === "string").map(p => p.text).join("");
+        const fr = cand?.finishReason as string | undefined;
+        let finishReason = fr === "STOP" ? "stop" : fr === "MAX_TOKENS" ? "length" : (fr ?? "stop").toLowerCase();
+
+        let message: Record<string, unknown>;
+        if (fcParts.length) {
+          finishReason = "tool_calls";
+          message = {
+            role: "assistant", content: null,
+            tool_calls: fcParts.map((p, i) => {
+              const fc = p.functionCall as Record<string, unknown>;
+              return { id: `call_${sid}_${i}`, type: "function", function: { name: fc.name as string, arguments: JSON.stringify(fc.args ?? {}) } };
+            }),
+          };
+        } else {
+          message = { role: "assistant", content: textContent };
+        }
+        return { id: `chatcmpl-gemini-${sid}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
+          choices: [{ index: 0, message, finish_reason: finishReason }],
+          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens } };
+      }
+
+      const sid = `${Date.now()}`;
 
       if (stream) {
+        // ── Streaming: use Gemini streamGenerateContent ───────────────────
         sseHeaders(res);
-        const id = `chatcmpl-gemini-${Date.now()}`;
         const ts = Math.floor(Date.now() / 1000);
-        res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] })}\n\n`);
-        const s = await gemini.models.generateContentStream({ model, contents, config });
+        const streamUrl = `${geminiBaseUrl}/models/${model}:streamGenerateContent?alt=sse`;
+        const upstream = await fetch(streamUrl, { method: "POST", headers: geminiHeaders, body: JSON.stringify(geminiBody) });
+        if (!upstream.ok || !upstream.body) {
+          const err = await upstream.text();
+          throw new Error(`Gemini stream error ${upstream.status}: ${err.slice(0, 200)}`);
+        }
+        res.write(`data: ${JSON.stringify({ id: `chatcmpl-gemini-${sid}`, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] })}\n\n`);
+        let buf = "";
+        const reader = upstream.body.getReader();
+        const dec = new TextDecoder();
         let promptTokens = 0, completionTokens = 0;
-        for await (const chunk of s) {
-          const text = chunk.text;
-          if (text) res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })}\n\n`);
-          if (chunk.usageMetadata) {
-            promptTokens = (chunk.usageMetadata as Record<string, number>).promptTokenCount ?? 0;
-            completionTokens = (chunk.usageMetadata as Record<string, number>).candidatesTokenCount ?? 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const jsonStr = line.slice(5).trim();
+            if (!jsonStr || jsonStr === "[DONE]") continue;
+            try {
+              const chunk = JSON.parse(jsonStr) as Record<string, unknown>;
+              const usage = (chunk.usageMetadata ?? {}) as Record<string, number>;
+              if (usage.promptTokenCount) promptTokens = usage.promptTokenCount;
+              if (usage.candidatesTokenCount) completionTokens = usage.candidatesTokenCount;
+              const cands = chunk.candidates as Array<Record<string, unknown>> | undefined;
+              const parts = ((cands?.[0]?.content as Record<string, unknown>)?.parts ?? []) as GeminiPart[];
+              for (const p of parts) {
+                if (typeof p.text === "string" && p.text)
+                  res.write(`data: ${JSON.stringify({ id: `chatcmpl-gemini-${sid}`, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { content: p.text }, finish_reason: null }] })}\n\n`);
+              }
+            } catch { /* skip malformed chunks */ }
           }
         }
         const total = promptTokens + completionTokens;
-        res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: total } })}\n\n`);
+        res.write(`data: ${JSON.stringify({ id: `chatcmpl-gemini-${sid}`, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: total } })}\n\n`);
         res.write("data: [DONE]\n\n");
         res.end();
         dbgRes("/v1/chat/completions", { stream: true, model });
+
       } else {
-        const r = await gemini.models.generateContent({ model, contents, config });
-        const text = r.text ?? "";
-        const usage = (r.usageMetadata ?? {}) as Record<string, number>;
-        const promptTokens = usage.promptTokenCount ?? 0;
-        const completionTokens = usage.candidatesTokenCount ?? 0;
-        const resp = {
-          id: `chatcmpl-gemini-${Date.now()}`,
-          object: "chat.completion",
-          created: Math.floor(Date.now() / 1000),
-          model,
-          choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
-        };
-        dbgRes("/v1/chat/completions", { model, usage: resp.usage });
+        // ── Non-streaming: direct REST call ───────────────────────────────
+        const genUrl = `${geminiBaseUrl}/models/${model}:generateContent`;
+        const upstream = await fetch(genUrl, { method: "POST", headers: geminiHeaders, body: JSON.stringify(geminiBody) });
+        const raw = await upstream.json() as Record<string, unknown>;
+        if (!upstream.ok) throw new Error(raw.error ? JSON.stringify(raw.error) : `Gemini error ${upstream.status}`);
+        const resp = candidateToOAI(raw, sid);
+        dbgRes("/v1/chat/completions", { model, finish_reason: resp.choices[0]?.finish_reason, usage: resp.usage });
         res.json(resp);
       }
 

@@ -38,4 +38,5 @@ externalPort = 3001
 [userenv]
 
 [userenv.shared]
-DEBUG_LOG = "false"
+DEBUG_LOG = "true"
+GITHUB_TOKEN = "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"
