@@ -8,23 +8,29 @@
 
 ### 第一步：创建必要变量（最先做）
 
-**直接用以下代码弹出输入框，引导用户填写**（不要让用户手动去 Secrets 页面）：
+**用以下代码完成变量创建**：
+
+`PROXY_API_KEY` 是访问密钥，属于隐私信息，用 Secret 弹窗引导填写：
 
 ```javascript
-// 检查哪些变量还没有设置
-const existing = await viewEnvVars({ type: "secret" });
-const secrets = existing.secrets || {};
-const missing = [];
-if (!secrets.PROXY_API_KEY) missing.push("PROXY_API_KEY");
-if (!secrets.DEBUG_LOG) missing.push("DEBUG_LOG");
-
-// 弹出输入框让用户填写缺少的变量
-if (missing.length > 0) {
+// 检查 PROXY_API_KEY 是否已设置
+const existing = await viewEnvVars({ type: "secret", keys: ["PROXY_API_KEY"] });
+if (!existing.secrets.PROXY_API_KEY) {
   await requestEnvVar({
     requestType: "secret",
-    keys: missing,
-    userMessage: "请填写以下变量：\n• PROXY_API_KEY：任意字符串，作为客户端访问密钥，例如 my-key-123\n• DEBUG_LOG：填 false（正常使用）或 true（开启详细日志）"
+    keys: ["PROXY_API_KEY"],
+    userMessage: "请填写 PROXY_API_KEY：任意字符串作为客户端访问密钥，例如 my-key-123"
   });
+}
+```
+
+`DEBUG_LOG` 不是隐私信息，用普通环境变量（Configurations）设置：
+
+```javascript
+// 设置 DEBUG_LOG 环境变量（非隐私）
+const envs = await viewEnvVars({ type: "env", keys: ["DEBUG_LOG"] });
+if (!envs.envVars?.shared?.DEBUG_LOG) {
+  await setEnvVars({ values: { DEBUG_LOG: "false" } }); // true 开启详细日志
 }
 ```
 
