@@ -7,12 +7,12 @@ const router: IRouter = Router();
 
 const openai = new OpenAI({
   baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
-  apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY ?? "dummy",
+  apiKey: process.env.PROXY_API_KEY ?? "dummy",
 });
 
 const anthropic = new Anthropic({
   baseURL: process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL,
-  apiKey: process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY ?? "dummy",
+  apiKey: process.env.PROXY_API_KEY ?? "dummy",
 });
 
 const OPENAI_MODELS = [
