@@ -33,8 +33,6 @@ pnpm 单体仓库
 | 变量 | 默认值 |
 |---|---|
 | `DEBUG_LOG` | `false` |
-| `AI_INTEGRATIONS_ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
-| `AI_INTEGRATIONS_OPENAI_BASE_URL` | `https://api.openai.com/v1` |
 
 ---
 

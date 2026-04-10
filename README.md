@@ -57,14 +57,6 @@ https://github.com/ytf211/ClaudeProxy
 |---|---|
 | `PROXY_API_KEY` | 自定义访问密钥，任意字符串，例如 `my-secret-key` |
 
-其他变量已由 `.replit` 自动填写，无需手动设置：
-
-| 变量 | 默认值 |
-|---|---|
-| `DEBUG_LOG` | `false` |
-| `AI_INTEGRATIONS_ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
-| `AI_INTEGRATIONS_OPENAI_BASE_URL` | `https://api.openai.com/v1` |
-
 ### 步骤 4 — 启动服务
 
 Replit 会自动识别 workflows，点击 **Run** 或手动启动：
@@ -123,15 +115,6 @@ claude
 Base URL : https://<你的域名>.replit.app/v1
 API Key  : <你的 PROXY_API_KEY>
 Model    : claude-sonnet-4-6
-```
-
-### 接入第三方中转站
-
-如需将 Anthropic / OpenAI 请求转发到第三方中转站，在 Secrets 中覆盖：
-
-```
-AI_INTEGRATIONS_ANTHROPIC_BASE_URL = https://your-relay.com
-AI_INTEGRATIONS_OPENAI_BASE_URL    = https://your-relay.com/v1
 ```
 
 ---
