@@ -7,12 +7,68 @@
  * Auth accepted:
  *   x-goog-api-key: <PROXY_API_KEY>   (Google GenAI SDK default)
  *   Authorization: Bearer <PROXY_API_KEY>
+ *   x-api-key: <PROXY_API_KEY>
  */
 
 import { Router, type IRouter, type Request, type Response } from "express";
 import { logger } from "../lib/logger";
 
 const router: IRouter = Router();
+
+const GEMINI_MODELS = [
+  {
+    name: "models/gemini-3.1-pro-preview",
+    baseModelId: "gemini-3.1-pro-preview",
+    version: "001",
+    displayName: "Gemini 3.1 Pro Preview",
+    description: "Gemini 3.1 Pro Preview model.",
+    inputTokenLimit: 1048576,
+    outputTokenLimit: 65536,
+    supportedGenerationMethods: ["generateContent", "countTokens", "streamGenerateContent"],
+    temperature: 1,
+    topP: 0.95,
+    topK: 64,
+  },
+  {
+    name: "models/gemini-3-flash-preview",
+    baseModelId: "gemini-3-flash-preview",
+    version: "001",
+    displayName: "Gemini 3 Flash Preview",
+    description: "Gemini 3 Flash Preview model.",
+    inputTokenLimit: 1048576,
+    outputTokenLimit: 65536,
+    supportedGenerationMethods: ["generateContent", "countTokens", "streamGenerateContent"],
+    temperature: 1,
+    topP: 0.95,
+    topK: 64,
+  },
+  {
+    name: "models/gemini-2.5-pro",
+    baseModelId: "gemini-2.5-pro",
+    version: "001",
+    displayName: "Gemini 2.5 Pro",
+    description: "Gemini 2.5 Pro model with enhanced reasoning.",
+    inputTokenLimit: 1048576,
+    outputTokenLimit: 65536,
+    supportedGenerationMethods: ["generateContent", "countTokens", "streamGenerateContent"],
+    temperature: 1,
+    topP: 0.95,
+    topK: 64,
+  },
+  {
+    name: "models/gemini-2.5-flash",
+    baseModelId: "gemini-2.5-flash",
+    version: "001",
+    displayName: "Gemini 2.5 Flash",
+    description: "Fast and efficient Gemini 2.5 Flash model.",
+    inputTokenLimit: 1048576,
+    outputTokenLimit: 65536,
+    supportedGenerationMethods: ["generateContent", "countTokens", "streamGenerateContent"],
+    temperature: 1,
+    topP: 0.95,
+    topK: 64,
+  },
+];
 
 function verifyKey(req: Request, res: Response): boolean {
   const expected = process.env.PROXY_API_KEY;
@@ -21,9 +77,10 @@ function verifyKey(req: Request, res: Response): boolean {
     return false;
   }
   const googKey = req.headers["x-goog-api-key"] as string | undefined;
-  const auth = req.headers["authorization"] ?? "";
+  const apiKey  = req.headers["x-api-key"] as string | undefined;
+  const auth    = req.headers["authorization"] ?? "";
   const bearerKey = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  const provided = googKey || bearerKey;
+  const provided = googKey || apiKey || bearerKey;
   if (!provided || provided !== expected) {
     res.status(401).json({ error: { code: "UNAUTHENTICATED", message: "Unauthorized" } });
     return false;
@@ -31,6 +88,27 @@ function verifyKey(req: Request, res: Response): boolean {
   return true;
 }
 
+// GET /v1beta/models  — list available Gemini models (static, Replit backend doesn't support this endpoint)
+router.get("/models", (req: Request, res: Response) => {
+  if (!verifyKey(req, res)) return;
+  res.json({ models: GEMINI_MODELS });
+});
+
+// GET /v1beta/models/:modelId  — get single model info
+router.get("/models/:modelId", (req: Request, res: Response) => {
+  if (!verifyKey(req, res)) return;
+  const modelId = req.params.modelId;
+  const model = GEMINI_MODELS.find(
+    (m) => m.baseModelId === modelId || m.name === modelId || m.name === `models/${modelId}`
+  );
+  if (!model) {
+    res.status(404).json({ error: { code: "NOT_FOUND", message: `Model ${modelId} not found` } });
+    return;
+  }
+  res.json(model);
+});
+
+// Catch-all: proxy everything else to Replit Gemini backend
 router.all(/(.*)/, async (req: Request, res: Response) => {
   if (!verifyKey(req, res)) return;
 
@@ -54,7 +132,7 @@ router.all(/(.*)/, async (req: Request, res: Response) => {
   };
   for (const [k, v] of Object.entries(req.headers)) {
     const lk = k.toLowerCase();
-    if (["host", "authorization", "x-goog-api-key", "content-length"].includes(lk)) continue;
+    if (["host", "authorization", "x-goog-api-key", "x-api-key", "content-length"].includes(lk)) continue;
     if (typeof v === "string") forwardHeaders[lk] = v;
   }
 
