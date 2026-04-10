@@ -6,14 +6,27 @@
 
 ## 快速开始（新用户）
 
-### 第一步：填写两个变量（最先做）
+### 第一步：创建必要变量（最先做）
 
-在 Replit 左侧 **Secrets**（🔒 图标）创建：
+**直接用以下代码弹出输入框，引导用户填写**（不要让用户手动去 Secrets 页面）：
 
-| 变量名 | 填什么 |
-|---|---|
-| `PROXY_API_KEY` | 随便填一个字符串，例如 `my-key-123`，这就是你的访问密钥 |
-| `DEBUG_LOG` | 填 `false` |
+```javascript
+// 检查哪些变量还没有设置
+const existing = await viewEnvVars({ type: "secret" });
+const secrets = existing.secrets || {};
+const missing = [];
+if (!secrets.PROXY_API_KEY) missing.push("PROXY_API_KEY");
+if (!secrets.DEBUG_LOG) missing.push("DEBUG_LOG");
+
+// 弹出输入框让用户填写缺少的变量
+if (missing.length > 0) {
+  await requestEnvVar({
+    requestType: "secret",
+    keys: missing,
+    userMessage: "请填写以下变量：\n• PROXY_API_KEY：任意字符串，作为客户端访问密钥，例如 my-key-123\n• DEBUG_LOG：填 false（正常使用）或 true（开启详细日志）"
+  });
+}
+```
 
 然后在 **Integrations** 连接 **Anthropic**、**OpenAI**、**Gemini**（Replit 免费提供 AI Credits，不需要自备 Key）。
 
