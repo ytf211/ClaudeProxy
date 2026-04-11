@@ -302,6 +302,19 @@ function circuitBlock(res: Response, provider: "anthropic" | "openai" | "gemini"
   return false;
 }
 
+/**
+ * Start sending SSE keep-alive comments every `intervalMs` milliseconds.
+ * Prevents intermediate proxies (e.g. Replit's reverse proxy) from closing
+ * idle streaming connections during long model inference (e.g. extended thinking).
+ * Returns a cleanup function — call it when the stream ends.
+ */
+function startSseKeepalive(res: Response, intervalMs = 15_000): () => void {
+  const id = setInterval(() => {
+    if (!res.writableEnded) res.write(": keep-alive\n\n");
+  }, intervalMs);
+  return () => clearInterval(id);
+}
+
 // ─── Debug log helpers ────────────────────────────────────────────────────────
 
 function sanitizeBodyForLog(body: Record<string, unknown>): Record<string, unknown> {
@@ -561,37 +574,42 @@ router.post("/chat/completions", async (req, res) => {
         const id = `chatcmpl-${Date.now()}`;
         let inputTokens = 0, outputTokens = 0;
 
-        const s = anthropic.messages.stream({
-          model, system,
-          messages: cleanMessages(messages) as AnthropicMessage[],
-          ...(tools ? { tools: cleanTools(tools) as AnthropicTool[] } : {}),
-          ...(toolChoice ? { tool_choice: toolChoice } : {}),
-          ...(thinking ? { thinking } : {}),
-          ...(temperature !== undefined ? { temperature } : {}),
-          ...(topP !== undefined ? { top_p: topP } : {}),
-          ...(topK !== undefined ? { top_k: topK } : {}),
-          ...(stopSequences ? { stop_sequences: stopSequences } : {}),
-          max_tokens: maxTokens,
-        }, reqOpts(effectiveBeta));
+        const stopKeepaliveA = startSseKeepalive(res);
+        try {
+          const s = anthropic.messages.stream({
+            model, system,
+            messages: cleanMessages(messages) as AnthropicMessage[],
+            ...(tools ? { tools: cleanTools(tools) as AnthropicTool[] } : {}),
+            ...(toolChoice ? { tool_choice: toolChoice } : {}),
+            ...(thinking ? { thinking } : {}),
+            ...(temperature !== undefined ? { temperature } : {}),
+            ...(topP !== undefined ? { top_p: topP } : {}),
+            ...(topK !== undefined ? { top_k: topK } : {}),
+            ...(stopSequences ? { stop_sequences: stopSequences } : {}),
+            max_tokens: maxTokens,
+          }, reqOpts(effectiveBeta));
 
-        for await (const e of s) {
-          const ts = Math.floor(Date.now() / 1000);
-          if (e.type === "message_start") {
-            inputTokens = e.message.usage.input_tokens;
-            res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] })}\n\n`);
-          } else if (e.type === "content_block_start" && e.content_block.type === "tool_use") {
-            res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { tool_calls: [{ index: e.index, id: e.content_block.id, type: "function", function: { name: e.content_block.name, arguments: "" } }] }, finish_reason: null }] })}\n\n`);
-          } else if (e.type === "content_block_delta") {
-            if (e.delta.type === "text_delta") {
-              res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { content: e.delta.text }, finish_reason: null }] })}\n\n`);
-            } else if (e.delta.type === "input_json_delta") {
-              res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { tool_calls: [{ index: e.index, function: { arguments: e.delta.partial_json } }] }, finish_reason: null }] })}\n\n`);
+          for await (const e of s) {
+            const ts = Math.floor(Date.now() / 1000);
+            if (e.type === "message_start") {
+              inputTokens = e.message.usage.input_tokens;
+              res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] })}\n\n`);
+            } else if (e.type === "content_block_start" && e.content_block.type === "tool_use") {
+              res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { tool_calls: [{ index: e.index, id: e.content_block.id, type: "function", function: { name: e.content_block.name, arguments: "" } }] }, finish_reason: null }] })}\n\n`);
+            } else if (e.type === "content_block_delta") {
+              if (e.delta.type === "text_delta") {
+                res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { content: e.delta.text }, finish_reason: null }] })}\n\n`);
+              } else if (e.delta.type === "input_json_delta") {
+                res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: { tool_calls: [{ index: e.index, function: { arguments: e.delta.partial_json } }] }, finish_reason: null }] })}\n\n`);
+              }
+            } else if (e.type === "message_delta") {
+              outputTokens = e.usage.output_tokens;
+              const fr = e.delta.stop_reason === "tool_use" ? "tool_calls" : "stop";
+              res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: {}, finish_reason: fr }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens } })}\n\n`);
             }
-          } else if (e.type === "message_delta") {
-            outputTokens = e.usage.output_tokens;
-            const fr = e.delta.stop_reason === "tool_use" ? "tool_calls" : "stop";
-            res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: {}, finish_reason: fr }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens } })}\n\n`);
           }
+        } finally {
+          stopKeepaliveA();
         }
         res.write("data: [DONE]\n\n");
         res.end();
@@ -640,14 +658,19 @@ router.post("/chat/completions", async (req, res) => {
       if (stream) {
         if (circuitBlock(res, "openai")) return;
         sseHeaders(res);
-        const s = await openai.chat.completions.create({
-          model, messages,
-          ...(rawTools ? { tools: rawTools } : {}),
-          ...(toolChoice ? { tool_choice: toolChoice } : {}),
-          ...oaiExtra,
-          max_completion_tokens: maxTokens, stream: true,
-        } as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming);
-        for await (const chunk of s) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        const stopKeepaliveB = startSseKeepalive(res);
+        try {
+          const s = await openai.chat.completions.create({
+            model, messages,
+            ...(rawTools ? { tools: rawTools } : {}),
+            ...(toolChoice ? { tool_choice: toolChoice } : {}),
+            ...oaiExtra,
+            max_completion_tokens: maxTokens, stream: true,
+          } as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming);
+          for await (const chunk of s) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        } finally {
+          stopKeepaliveB();
+        }
         res.write("data: [DONE]\n\n");
         res.end();
         dbgRes("/v1/chat/completions", { stream: true, model });
@@ -790,10 +813,12 @@ router.post("/chat/completions", async (req, res) => {
         // ── Streaming: use Gemini streamGenerateContent ───────────────────
         if (circuitBlock(res, "gemini")) return;
         sseHeaders(res);
+        const stopKeepaliveG = startSseKeepalive(res);
         const ts = Math.floor(Date.now() / 1000);
         const streamUrl = `${geminiBaseUrl}/models/${model}:streamGenerateContent?alt=sse`;
         const upstream = await fetch(streamUrl, { method: "POST", headers: geminiHeaders, body: JSON.stringify(geminiBody) });
         if (!upstream.ok || !upstream.body) {
+          stopKeepaliveG();
           const err = await upstream.text();
           throw new Error(`Gemini stream error ${upstream.status}: ${err.slice(0, 200)}`);
         }
@@ -802,7 +827,7 @@ router.post("/chat/completions", async (req, res) => {
         const reader = upstream.body.getReader();
         const dec = new TextDecoder();
         let promptTokens = 0, completionTokens = 0;
-        while (true) {
+        try { while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           buf += dec.decode(value, { stream: true });
@@ -825,7 +850,7 @@ router.post("/chat/completions", async (req, res) => {
               }
             } catch { /* skip malformed chunks */ }
           }
-        }
+        } } finally { stopKeepaliveG(); }
         const total = promptTokens + completionTokens;
         res.write(`data: ${JSON.stringify({ id: `chatcmpl-gemini-${sid}`, object: "chat.completion.chunk", created: ts, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: total } })}\n\n`);
         res.write("data: [DONE]\n\n");
@@ -920,8 +945,13 @@ router.post("/messages", async (req, res) => {
       if (stream) {
         if (circuitBlock(res, "anthropic")) return;
         sseHeaders(res);
-        const s = anthropic.messages.stream(params as Anthropic.MessageStreamParams, reqOpts(effectiveBeta));
-        for await (const e of s) res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+        const stopKeepalive = startSseKeepalive(res);
+        try {
+          const s = anthropic.messages.stream(params as Anthropic.MessageStreamParams, reqOpts(effectiveBeta));
+          for await (const e of s) res.write(`event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`);
+        } finally {
+          stopKeepalive();
+        }
         res.end();
         dbgRes("/v1/messages", { stream: true, model });
       } else {
@@ -953,25 +983,30 @@ router.post("/messages", async (req, res) => {
       if (stream) {
         sseHeaders(res);
         const msgId = `msg_${Date.now()}`;
+        const stopKeepalive2 = startSseKeepalive(res);
 
         // Emit Anthropic SSE preamble
         res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: msgId, type: "message", role: "assistant", content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
         res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`);
 
         // Real streaming — emit each delta as it arrives
-        const s = await openai.chat.completions.create({
-          model, messages: oaiMessages,
-          ...(oaiTools ? { tools: oaiTools } : {}),
-          ...(oaiToolChoice ? { tool_choice: oaiToolChoice } : {}),
-          ...oaiSampling,
-          max_completion_tokens: maxTokens, stream: true,
-        } as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming);
+        try {
+          const s = await openai.chat.completions.create({
+            model, messages: oaiMessages,
+            ...(oaiTools ? { tools: oaiTools } : {}),
+            ...(oaiToolChoice ? { tool_choice: oaiToolChoice } : {}),
+            ...oaiSampling,
+            max_completion_tokens: maxTokens, stream: true,
+          } as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming);
 
-        for await (const chunk of s) {
-          const text = chunk.choices[0]?.delta?.content;
-          if (text) {
-            res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n`);
+          for await (const chunk of s) {
+            const text = chunk.choices[0]?.delta?.content;
+            if (text) {
+              res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n`);
+            }
           }
+        } finally {
+          stopKeepalive2();
         }
 
         res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
@@ -1072,15 +1107,19 @@ router.post("/responses", async (req, res) => {
         writeSSE("response.output_item.added", { output_index: 0, item: { type: "message", id: msgId, role: "assistant", content: [], status: "in_progress" } });
         writeSSE("response.content_part.added", { item_id: msgId, output_index: 0, content_index: 0, part: { type: "output_text", text: "" } });
 
-        const s = anthropic.messages.stream(params as Anthropic.MessageStreamParams, reqOpts(effectiveBeta));
+        const stopKeepaliveR1 = startSseKeepalive(res);
         let fullText = "", inputTokens = 0, outputTokens = 0;
-
-        for await (const e of s) {
-          if (e.type === "message_start") inputTokens = e.message.usage.input_tokens;
-          else if (e.type === "content_block_delta" && e.delta.type === "text_delta") {
-            fullText += e.delta.text;
-            writeSSE("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta: e.delta.text });
-          } else if (e.type === "message_delta") outputTokens = e.usage.output_tokens;
+        try {
+          const s = anthropic.messages.stream(params as Anthropic.MessageStreamParams, reqOpts(effectiveBeta));
+          for await (const e of s) {
+            if (e.type === "message_start") inputTokens = e.message.usage.input_tokens;
+            else if (e.type === "content_block_delta" && e.delta.type === "text_delta") {
+              fullText += e.delta.text;
+              writeSSE("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta: e.delta.text });
+            } else if (e.type === "message_delta") outputTokens = e.usage.output_tokens;
+          }
+        } finally {
+          stopKeepaliveR1();
         }
 
         writeSSE("response.output_text.done", { item_id: msgId, output_index: 0, content_index: 0, text: fullText });
@@ -1119,19 +1158,23 @@ router.post("/responses", async (req, res) => {
         writeSSE("response.output_item.added", { output_index: 0, item: { type: "message", id: msgId, role: "assistant", content: [], status: "in_progress" } });
         writeSSE("response.content_part.added", { item_id: msgId, output_index: 0, content_index: 0, part: { type: "output_text", text: "" } });
 
-        const s = await openai.chat.completions.create({
-          model, messages: oaiMessages,
-          ...(oaiTools ? { tools: oaiTools } : {}),
-          max_completion_tokens: maxTokens, stream: true,
-        });
-
+        const stopKeepaliveR2 = startSseKeepalive(res);
         let fullText = "";
-        for await (const chunk of s) {
-          const delta = chunk.choices[0]?.delta?.content;
-          if (delta) {
-            fullText += delta;
-            writeSSE("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta });
+        try {
+          const s = await openai.chat.completions.create({
+            model, messages: oaiMessages,
+            ...(oaiTools ? { tools: oaiTools } : {}),
+            max_completion_tokens: maxTokens, stream: true,
+          });
+          for await (const chunk of s) {
+            const delta = chunk.choices[0]?.delta?.content;
+            if (delta) {
+              fullText += delta;
+              writeSSE("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta });
+            }
           }
+        } finally {
+          stopKeepaliveR2();
         }
 
         writeSSE("response.output_text.done", { item_id: msgId, output_index: 0, content_index: 0, text: fullText });
