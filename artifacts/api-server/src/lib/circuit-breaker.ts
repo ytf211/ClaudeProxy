@@ -3,9 +3,9 @@ import { logger } from "./logger";
 type CBState = "CLOSED" | "OPEN" | "HALF_OPEN";
 
 export interface CircuitBreakerOptions {
-  failureThreshold?: number;  // consecutive failures to trip (default 5)
-  successThreshold?: number;  // successes in HALF_OPEN to close (default 1)
-  recoveryTimeoutMs?: number; // ms to wait before HALF_OPEN probe (default 30s)
+  failureThreshold?: number;
+  successThreshold?: number;
+  recoveryTimeoutMs?: number;
 }
 
 export class CircuitBreaker {
@@ -36,7 +36,6 @@ export class CircuitBreaker {
   }
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
-    // OPEN — maybe probe
     if (this.state === "OPEN") {
       if (Date.now() - this.openedAt >= this.recoveryTimeoutMs) {
         this.transition("HALF_OPEN");
@@ -67,7 +66,6 @@ export class CircuitBreaker {
   }
 
   private onFailure(err: unknown) {
-    // Don't count 4xx as circuit-breaker failures (client errors, not provider down)
     const status = (err as Record<string, unknown>).status as number | undefined;
     if (status && status >= 400 && status < 500) return;
 
@@ -91,7 +89,6 @@ export class CircuitOpenError extends Error {
   }
 }
 
-// One breaker per provider, shared across requests
 export const breakers = {
   anthropic: new CircuitBreaker("anthropic", { failureThreshold: 5, recoveryTimeoutMs: 30_000 }),
   openai:    new CircuitBreaker("openai",    { failureThreshold: 5, recoveryTimeoutMs: 30_000 }),

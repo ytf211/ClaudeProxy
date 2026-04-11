@@ -162,8 +162,6 @@ function getThinkingParam(body: Record<string, unknown>): Anthropic.ThinkingConf
 /**
  * When thinking is active (enabled or adaptive), inject the extended-thinking
  * beta header unless it is already present in the client-supplied header.
- * This ensures /v1/chat/completions clients (e.g. rikkahub) that send thinking
- * params but omit the beta header still work correctly.
  */
 function withThinkingBeta(beta: string | undefined, thinking: Anthropic.ThinkingConfigParam | undefined): string | undefined {
   if (!thinking) return beta;
@@ -173,6 +171,98 @@ function withThinkingBeta(beta: string | undefined, thinking: Anthropic.Thinking
   if (!beta) return needed;
   if (beta.includes(needed)) return beta;
   return `${beta},${needed}`;
+}
+
+/**
+ * Detect whether any content block in messages or system has cache_control set.
+ * If so, automatically inject the prompt-caching beta header so Anthropic
+ * actually caches the content — even when the client omits the header.
+ */
+function hasCacheControl(
+  messages: unknown[],
+  system: unknown,
+): boolean {
+  const hasCC = (v: unknown): boolean => {
+    if (!v || typeof v !== "object") return false;
+    const obj = v as Record<string, unknown>;
+    if (obj.cache_control) return true;
+    if (Array.isArray(obj)) return (obj as unknown[]).some(hasCC);
+    return Object.values(obj).some(hasCC);
+  };
+  return hasCC(system) || messages.some(hasCC);
+}
+
+function withCachingBeta(beta: string | undefined, messages: unknown[], system: unknown): string | undefined {
+  const needed = "prompt-caching-2024-07-31";
+  if (beta?.includes(needed)) return beta; // already set
+  if (!hasCacheControl(messages, system)) return beta; // no cache_control blocks
+  return beta ? `${beta},${needed}` : needed;
+}
+
+// ─── Context Management ───────────────────────────────────────────────────────
+
+interface ContextManagement {
+  enabled?: boolean;
+  max_tokens?: number;
+  truncation_strategy?: string; // "oldest_first" (default) or "summarize"
+}
+
+/**
+ * Rough token estimator: ~4 chars per token (good enough for truncation decisions).
+ */
+function estimateTokens(value: unknown): number {
+  if (typeof value === "string") return Math.ceil(value.length / 4);
+  if (Array.isArray(value)) return value.reduce((s, v) => s + estimateTokens(v), 0);
+  if (value && typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).reduce(
+      (s: number, v) => s + estimateTokens(v), 0,
+    );
+  }
+  return 1;
+}
+
+/**
+ * Apply context_management settings to the messages array.
+ * When enabled, trims oldest messages (preserving alternating user/assistant pairs)
+ * until the estimated token count fits within the budget.
+ */
+function applyContextManagement(
+  messages: AnthropicMessage[],
+  system: unknown,
+  cm: ContextManagement,
+  maxTokensOutput: number,
+  model: string,
+): AnthropicMessage[] {
+  if (!cm.enabled) return messages;
+
+  // Model context windows (tokens). All current Claude models: 200K.
+  const contextWindow = 200_000;
+  // Leave room for the output tokens
+  const budget = cm.max_tokens ?? (contextWindow - maxTokensOutput - 2_000);
+
+  const systemTokens = estimateTokens(system ?? "");
+  let msgTokens = estimateTokens(messages);
+
+  if (systemTokens + msgTokens <= budget) return messages; // fits, nothing to do
+
+  // Drop oldest messages (pairs when possible) until we fit.
+  // Always keep at least the last user message.
+  let trimmed = [...messages];
+  while (trimmed.length > 1 && systemTokens + estimateTokens(trimmed) > budget) {
+    // Remove from the front; skip pairs so conversation stays valid
+    if (trimmed.length >= 2) {
+      trimmed = trimmed.slice(2);
+    } else {
+      trimmed = trimmed.slice(1);
+    }
+  }
+
+  const dropped = messages.length - trimmed.length;
+  if (dropped > 0) {
+    logger.info({ model, dropped, remaining: trimmed.length, budget },
+      "context_management: trimmed oldest messages to fit context window");
+  }
+  return trimmed;
 }
 
 // ─── Streaming fallback for non-streaming Anthropic requests ──────────────────
@@ -776,25 +866,51 @@ router.post("/messages", async (req, res) => {
 
   dbgReq("/v1/messages", req, body);
 
-  // Strip fields that Anthropic doesn't accept
-  const { output_config: _oc, stream_options: _so, reasoning_effort: _re, ...cleanBody } =
-    body as Record<string, unknown>;
+  // Extract context_management before whitelisting (handle it ourselves).
+  const contextMgmt: ContextManagement =
+    (body.context_management && typeof body.context_management === "object")
+      ? (body.context_management as ContextManagement)
+      : {};
+
+  // Whitelist only fields that Anthropic's Messages API accepts.
+  // Clients like Claude Code send extra fields (e.g. context_management,
+  // original_request_id) that Anthropic rejects with 400 invalid_request_error.
+  const ANTHROPIC_ALLOWED = new Set([
+    "model", "messages", "max_tokens", "system", "tools", "tool_choice",
+    "thinking", "stream", "temperature", "top_p", "top_k", "metadata",
+    "stop_sequences",
+  ]);
+  const cleanBody: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(body)) {
+    if (ANTHROPIC_ALLOWED.has(k)) cleanBody[k] = v;
+  }
 
   try {
     if (isAnthropicModel(model)) {
       const rawMessages = (cleanBody.messages as unknown[]) ?? [];
-      const cleanedMessages = cleanMessages(rawMessages) as AnthropicMessage[];
+      const maxOut = clampMaxTokens(model, cleanBody.max_tokens as number | undefined);
+      const cleanedMessages = applyContextManagement(
+        cleanMessages(rawMessages) as AnthropicMessage[],
+        cleanBody.system,
+        contextMgmt,
+        maxOut,
+        model,
+      );
       const cleanedSystem = cleanSystemBlocks(cleanBody.system);
       const rawTools = cleanBody.tools as unknown[] | undefined;
       const cleanedTools = rawTools ? cleanTools(rawTools) : undefined;
-      // thinking passes through via cleanBody spread; we only need the beta injection
+      // Auto-inject beta headers: thinking + prompt-caching (if cache_control blocks present)
       const thinkingParam = getThinkingParam(cleanBody);
-      const effectiveBeta = withThinkingBeta(beta, thinkingParam);
+      const effectiveBeta = withCachingBeta(
+        withThinkingBeta(beta, thinkingParam),
+        cleanedMessages,
+        cleanedSystem,
+      );
 
       const params: Anthropic.MessageCreateParams = {
         ...(cleanBody as Omit<Anthropic.MessageCreateParams, "model" | "max_tokens" | "messages">),
         model,
-        max_tokens: clampMaxTokens(model, cleanBody.max_tokens as number | undefined),
+        max_tokens: maxOut,
         messages: cleanedMessages,
         system: cleanedSystem as Anthropic.MessageCreateParams["system"],
         ...(cleanedTools ? { tools: cleanedTools as AnthropicTool[] } : {}),
